@@ -4,3 +4,6 @@
 *.mod.h
 modules.order
 Module.symvers
+.tmp_versions
+*.cmd
+*.ko
