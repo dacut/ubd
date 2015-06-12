@@ -488,16 +488,17 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 }
 
 
-static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *message)
-{
+static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
+    struct bio_vec bvec;
+    struct req_iterator iter;
     struct request *rq;
-    uint32_t msgtype = message->ubd_header.ubd_msgtype;
+    uint32_t msgtype = reply->ubd_header.ubd_msgtype;
     uint32_t size = size;
 
     /* Make sure the message type and size are sensical. */
     if (msgtype == UBD_MSGTYPE_READ_REPLY) {
         if (size < offsetof(struct ubd_reply, ubd_data)) {
-            printk(KERN_WARNING "ubd received invalid read reply packet with "
+            printk(KERN_INFO "ubd: received invalid read reply packet with "
                    "size %u (minimum is %zu)\n", size,
                    offsetof(struct ubd_reply, ubd_data));
             return;
@@ -505,48 +506,92 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *message)
 
         /* Make sure the size of the data is on a sector boundary. */
         if ((size - offsetof(struct ubd_reply, ubd_data)) % 512 != 0) {
-            printk(KERN_WARNING "ubd received invalid read reply packet with "
+            printk(KERN_INFO "ubd: received invalid read reply packet with "
                    "size %u (not a sector-sized reply)\n", size);
             return;
         }
     } else if (msgtype == UBD_MSGTYPE_WRITE_REPLY) {
         if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_WARNING "ubd received invalid write reply packet with "
+            printk(KERN_INFO "ubd: received invalid write reply packet with "
                    "size %u (expected %zu)\n", size, sizeof(struct ubd_reply));
             return;
         }
     } else if (msgtype == UBD_MSGTYPE_DISCARD_REPLY) {
         if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_WARNING "ubd received invalid discard reply packet "
+            printk(KERN_INFO "ubd: received invalid discard reply packet "
                    "with size %u (expected %zu)\n", size,
                    sizeof(struct ubd_reply));
             return;
         }
     } else {
-        printk(KERN_WARNING "ubd received invalid reply type 0x%x\n",
-               msgtype);
+        printk(KERN_INFO "ubd: received invalid reply type 0x%x\n", msgtype);
         return;
     }
 
     spin_lock(&dev->lock);
 
     /* Find the request this belongs to. */
-    rq = blk_queue_find_tag(dev->blk_pending, message->ubd_header.ubd_tag);
+    rq = blk_queue_find_tag(dev->blk_pending, reply->ubd_header.ubd_tag);
     if (rq == NULL) {
         spin_unlock(&dev->lock);
-        printk(KERN_WARNING "ubd received reply for unknown tag %u\n",
-               message->ubd_header.ubd_tag);
+        printk(KERN_INFO "ubd: received reply for unknown tag %u\n",
+               reply->ubd_header.ubd_tag);
         return;
     }
 
-    if (msgtype == UBD_MSGTYPE_READ_REPLY) {
-        /* Make sure the reply size correctly reflects the requested size. */
-        /* FIXME: Implement */
-    }
+    rq_for_each_segment(bvec, rq, iter) {
+        struct bio *bio = iter.bio;
+        uint32_t n_sectors = bio_sectors(bio);
+        
+        BUG_ON(bio_segments(bio) != 1);
 
-    /* TODO: Copy the reply back to the block device. */
-    
+        if (reply->ubd_status < 0) {
+            /* Error received */
+            blk_end_request_err(rq, reply->ubd_status);
+        } else if (reply->ubd_status != n_sectors) {
+            /* Sector count mismatch. */
+            printk(KERN_INFO "ubd: expected %u sectors; received %u "
+                   "sectors.\n", n_sectors, reply->ubd_status);
+            blk_end_request_err(rq, -EIO);
+        } else if (bio_data_dir(bio) == READ) {
+            /* Read request */
+            uint32_t recv_data = reply->ubd_header.ubd_size -
+                offsetof(struct ubd_reply, ubd_data);
+            
+            if (msgtype != UBD_MSGTYPE_READ_REPLY) {
+                /* Reply type doesn't match what was requested. */
+                printk(KERN_INFO "ubd: expected read reply packet.\n");
+                blk_end_request_err(rq, -EIO);
+            } else if (recv_data != 512 * n_sectors) {
+                /* Reply size does not match the requested size. */
+                printk(KERN_INFO "ubd: expected %u bytes; received %u bytes.\n",
+                       512 * n_sectors, recv_data);
+                blk_end_request_err(rq, -EIO);
+            } else {
+                /* Ok -- copy the data back. */
+                memcpy(bio_data(bio), reply->ubd_data, recv_data);
+                blk_end_request(rq, 0, recv_data);
+            }
+        } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
+            if (msgtype != UBD_MSGTYPE_DISCARD_REPLY) {
+                printk(KERN_INFO "ubd: expected discard reply packet.\n");
+                blk_end_request_err(rq, -EIO);
+            } else {
+                blk_end_request(rq, 0, 0);
+            }
+        } else {
+            if (msgtype != UBD_MSGTYPE_WRITE_REPLY) {
+                printk(KERN_INFO "ubd: expected write reply packet.\n");
+                blk_end_request_err(rq, -EIO);
+            } else {
+                blk_end_request(rq, 0, 0);
+            }
+        }
+    }
+            
+    blk_queue_end_tag(rq->q, rq);
     spin_unlock(&dev->lock);
+    return;
 }
 
 
@@ -714,13 +759,13 @@ static void ubdblk_handle_request(struct request_queue *rq) {
 }
 
 
-static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *r) {
+static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
     struct bio_vec bvec;
     struct req_iterator iter;
     struct ubd_outgoing_message *msg;
     struct ubd_request *ureq;
 
-    rq_for_each_segment(bvec, r, iter) {
+    rq_for_each_segment(bvec, rq, iter) {
         struct bio *bio = iter.bio;
         size_t req_size = sizeof(*ureq);
         void *data = NULL;
@@ -731,7 +776,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *r) {
         if ((msg = kmalloc(sizeof(*msg), GFP_NOIO)) == NULL) {
             printk(KERN_ERR "ubd: failed to allocate %zu bytes for request.\n",
                    sizeof(*msg));
-            blk_end_request_err(r, -ENOMEM);
+            blk_end_request_err(rq, -ENOMEM);
             return;
         }
 
@@ -746,17 +791,17 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *r) {
             printk(KERN_ERR "ubd: failed to allocate %zu bytes for request.\n",
                    req_size);
             kfree(msg);
-            blk_end_request_err(r, -ENOMEM);
+            blk_end_request_err(rq, -ENOMEM);
             return;            
         }
                    
         /* Allocate a tag for this request */
-        if (blk_queue_start_tag(r->q, r) != 0) {
+        if (blk_queue_start_tag(rq->q, rq) != 0) {
             /* Out of tags; give up. */
             printk(KERN_ERR "ubd: could not get a tag for a request\n");
             kfree(msg->request);
             kfree(msg);
-            blk_end_request_err(r, -ENOMEM);
+            blk_end_request_err(rq, -ENOMEM);
             return;            
         }
 
@@ -768,7 +813,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *r) {
                 bio->bi_rw & REQ_DISCARD ? UBD_MSGTYPE_DISCARD_REQUEST :
                 UBD_MSGTYPE_WRITE_REQUEST));
         ureq->ubd_header.ubd_size = req_size;
-        ureq->ubd_header.ubd_tag = r->tag;
+        ureq->ubd_header.ubd_tag = rq->tag;
         ureq->ubd_first_sector = iter.iter.bi_sector;
         ureq->ubd_nsectors = bio_sectors(bio);
 

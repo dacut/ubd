@@ -106,7 +106,7 @@ struct ubd_reply {
     /** Size in 512-byte sectors of data written, or (if negative) an error
      *  code.
      */
-    int64_t ubd_status;
+    int32_t ubd_status;
 
     /** Data for this reply. */
     char ubd_data[0];
