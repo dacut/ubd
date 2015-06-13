@@ -21,7 +21,7 @@
 #define UBD_IOCGETCOUNT    _IOR(UBD_IOC_MAGIC, 0xa2, int)
 
 /** ioctl: describe block device. */
-#define UBD_IOCDESCRIBE     _IOWR(UBD_IOC_MAGIC, 0xa3, struct ubd_info)
+#define UBD_IOCDESCRIBE     _IOWR(UBD_IOC_MAGIC, 0xa3, struct ubd_describe)
 
 /** ubd_flags: device is read only. */
 #define UBD_FL_READ_ONLY    0x00000001
@@ -45,6 +45,14 @@ struct ubd_info {
 
     /** Minor number */
     uint32_t ubd_minor;
+};
+
+struct ubd_describe {
+    /** In: the index to return. */
+    size_t ubd_index;
+
+    /** Out: The resulting ubd_info data. */
+    struct ubd_info ubd_info;
 };
 
 /** ubd_msgtype code for a read request. */

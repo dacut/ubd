@@ -1,5 +1,5 @@
 /** @file   ublkdev.c
- *  @brief  
+ *  @brief
  */
 
 #include <linux/bio.h>
@@ -27,6 +27,9 @@ MODULE_PARM_DESC(ubd_major, "UBD major node");
 
 /** List of block devices allocated. */
 LIST_HEAD(ubd_devices);
+
+/** Lock for ubd_devices. */
+DEFINE_SPINLOCK(ubd_devices_lock);
 
 /** Initialize the driver. */
 static int __init ubd_init(void);
@@ -162,11 +165,11 @@ static int __init ubd_init(void) {
     if (ubd_major == 0) {
         ubd_major = result;
     }
-    
+
     printk(KERN_DEBUG "ubd registered as block device %d\n", ubd_major);
 
     return 0;
-    
+
 error:
     ubd_exit();
 
@@ -182,7 +185,7 @@ static void __exit ubd_exit(void) {
     }
 
     if (ubdctl_miscdevice.minor != MISC_DYNAMIC_MINOR) {
-        misc_deregister(&ubdctl_miscdevice);        
+        misc_deregister(&ubdctl_miscdevice);
     }
 
     return;
@@ -196,7 +199,7 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
        Do not allow I/O to happen; we could loop if the system has a swapfile
        mounted on a ublkdev device. */
     struct ublkdev *dev;
-    
+
     dev = kmalloc(sizeof(struct ublkdev), GFP_NOIO);
     if (dev == NULL) {
         return -ENOMEM;
@@ -225,13 +228,13 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
     dev->status = 0;
     init_waitqueue_head(&dev->status_wait);
     dev->flags = 0;
-    
+
     return 0;
 }
 
 static int ubdctl_release(struct inode *inode, struct file *filp) {
     int result;
-    
+
     if (filp->private_data != NULL) {
         struct ublkdev *dev = filp->private_data;
 
@@ -290,10 +293,10 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
     BUG_ON(dev == NULL);
 
     spin_lock(&dev->lock);
-    
+
     while (dev->ctl_current_outgoing == NULL) {
         struct list_head *first_message;
-        
+
         /* Need to pull a new message off the queue. */
         while (list_empty(& dev->ctl_outgoing_head)) {
             /* No messages; sleep until we have a new one. */
@@ -364,7 +367,7 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     ssize_t n_to_read = 0;
 
     BUG_ON(dev == NULL);
-    
+
     spin_lock(&dev->lock);
 
     in = &dev->ctl_incoming;
@@ -436,7 +439,7 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     {
         /* Failed -- userspace range isn't fully valid. */
         spin_unlock(&dev->lock);
-        
+
         if (n_read > 0) {
             /* Can't return EFAULT here -- we're already read part of the buffer
                to get at the header. */
@@ -451,7 +454,7 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
         /* Yep; parse it. */
         ubdctl_handle_reply(dev, in->reply);
     }
-    
+
     spin_unlock(&dev->lock);
     return n_read;
 }
@@ -461,7 +464,7 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     struct ublkdev *dev = filp->private_data;
     unsigned long req_events = poll_requested_events(wait);
     unsigned int result = 0;
-    
+
     BUG_ON(dev == NULL);
 
     if ((req_events & (POLLIN | POLLRDNORM)) != 0) {
@@ -495,7 +498,7 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
     case UBD_IOCREGISTER: {
         struct ubd_info info;
         long result;
-        
+
         /* Get the disk info from userspace. */
         if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
             printk(KERN_DEBUG "ubd: invalid userspace address\n");
@@ -519,18 +522,73 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
     }
 
     case UBD_IOCGETCOUNT: {
-        break;
+        struct list_head *iter;
+        size_t count = 0;
+
+        spin_lock(&ubd_devices_lock);
+        list_for_each(iter, &ubd_devices) {
+            ++count;
+        }
+        spin_unlock(&ubd_devices_lock);
+        return count;
     }
 
     case UBD_IOCDESCRIBE: {
-        break;
+        struct ubd_describe desc;
+        struct list_head *iter;
+        size_t index = 0;
+
+        /* Get the describe structure from userspace. */
+        if (copy_from_user(&desc, (void *) data, sizeof(desc)) != 0) {
+            printk(KERN_DEBUG "ubd: invalid userspace address\n");
+            return -EFAULT;
+        }
+
+        spin_lock(&ubd_devices_lock);
+        list_for_each(iter, &ubd_devices) {
+            struct ublkdev *dev;
+
+            if (index != desc.ubd_index) {
+                ++index;
+                continue;
+            }
+
+            /* Found it; return this. */
+            dev = container_of(iter, struct ublkdev, list);
+            spin_unlock(&ubd_devices_lock);
+            spin_lock(&dev->lock);
+
+            if (dev->disk == NULL) {
+                /* Already deallocated? */
+                spin_unlock(&dev->lock);
+                return -EAGAIN;
+            }
+
+            memcpy(desc.ubd_info.ubd_name, dev->disk->disk_name,
+                   DISK_NAME_LEN);
+            desc.ubd_info.ubd_flags = dev->flags;
+            desc.ubd_info.ubd_nsectors = get_capacity(dev->disk);
+            desc.ubd_info.ubd_major = dev->disk->major;
+            desc.ubd_info.ubd_minor = dev->disk->first_minor;
+
+            spin_unlock(&dev->lock);
+
+            if (copy_to_user((void *) data, &desc, sizeof(desc)) != 0) {
+                printk(KERN_DEBUG "ubd: invalid userspace address\n");
+                return -EFAULT;
+            }
+
+            return 0;
+        }
+        spin_unlock(&ubd_devices_lock);
+        return -EINVAL;
     }
 
     default:
         return -EINVAL;
     }
 
-    return 0;
+    return -EINVAL;
 }
 
 
@@ -588,7 +646,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     rq_for_each_segment(bvec, rq, iter) {
         struct bio *bio = iter.bio;
         uint32_t n_sectors = bio_sectors(bio);
-        
+
         BUG_ON(bio_segments(bio) != 1);
 
         if (reply->ubd_status < 0) {
@@ -603,7 +661,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
             /* Read request */
             uint32_t recv_data = reply->ubd_header.ubd_size -
                 offsetof(struct ubd_reply, ubd_data);
-            
+
             if (msgtype != UBD_MSGTYPE_READ_REPLY) {
                 /* Reply type doesn't match what was requested. */
                 printk(KERN_INFO "ubd: expected read reply packet.\n");
@@ -634,7 +692,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
             }
         }
     }
-            
+
     blk_queue_end_tag(rq->q, rq);
     spin_unlock(&dev->lock);
     return;
@@ -646,7 +704,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     struct gendisk *disk;
     int major;
     int result = -EINVAL;
-        
+
     spin_lock(&dev->lock);
 
     /* Make sure we haven't already registered a disk on this control
@@ -662,7 +720,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     /* Make sure the name is NUL terminated. */
     memcpy(name, info->ubd_name, DISK_NAME_LEN);
     name[DISK_NAME_LEN] = '\0';
-    
+
     /* Register the block device. */
     if ((major = register_blkdev(0, name)) < 0) {
         /* Error -- maybe in the name? */
@@ -673,7 +731,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     }
 
     info->ubd_major = (uint32_t) major;
-    
+
     /* Allocate a disk structure. */
     /* FIXME: Allow users to register more than 1 minor. */
     if ((dev->disk = disk = alloc_disk(1)) == NULL) {
@@ -711,6 +769,11 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     dev->flags = info->ubd_flags;
     result = 0;
 
+    /* Add this to the list of registered disks. */
+    spin_lock(&ubd_devices_lock);
+    list_add_tail(&dev->list, &ubd_devices);
+    spin_unlock(&ubd_devices_lock);
+
 done:
     spin_unlock(&dev->lock);
     return result;
@@ -719,7 +782,7 @@ done:
 
 static int ubdctl_unregister(struct ublkdev *dev) {
     int result;
-    
+
     spin_lock(&dev->lock);
     result = ubdctl_unregister_nolock(dev);
     spin_lock(&dev->lock);
@@ -755,7 +818,7 @@ static int ubdctl_unregister_nolock(struct ublkdev *dev) {
         /* Wait for the device to be unmounted. */
         while ((dev->status & UBD_STATUS_OPENED) != 0) {
             int wait_result;
-            
+
             spin_unlock(&dev->lock);
             wait_result = wait_event_interruptible(
                 dev->status_wait,
@@ -781,6 +844,11 @@ static int ubdctl_unregister_nolock(struct ublkdev *dev) {
     blk_cleanup_queue(dev->blk_pending);
     dev->blk_pending = NULL;
     dev->disk = NULL;
+
+    /* Remove this disk structure from the list of devices. */
+    spin_lock(&ubd_devices_lock);
+    list_del(&dev->list);
+    spin_unlock(&ubd_devices_lock);
 
     return 0;
 }
@@ -870,9 +938,9 @@ static void ubdblk_handle_request(struct request_queue *rq) {
         if (unlikely(! is_running)) {
             /* Device is not running; fail the request. */
             blk_end_request_err(req, -EIO);
-            continue;            
+            continue;
         }
-        
+
         spin_unlock_irq(rq->queue_lock);
 
         switch (req->cmd_type) {
@@ -900,7 +968,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         struct bio *bio = iter.bio;
         size_t req_size = sizeof(*ureq);
         void *data = NULL;
-        
+
         BUG_ON(bio_segments(bio) != 1);
 
         /* Allocate the message structure */
@@ -923,9 +991,9 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
                    req_size);
             kfree(msg);
             blk_end_request_err(rq, -ENOMEM);
-            return;            
+            return;
         }
-                   
+
         /* Allocate a tag for this request */
         if (blk_queue_start_tag(rq->q, rq) != 0) {
             /* Out of tags; give up. */
@@ -933,7 +1001,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
             kfree(msg->request);
             kfree(msg);
             blk_end_request_err(rq, -ENOMEM);
-            return;            
+            return;
         }
 
         /* Initialize the request */
@@ -954,7 +1022,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
 
         /* Queue the request for the control endpoint. */
         spin_lock(&dev->lock);
-        list_add_tail(&dev->ctl_outgoing_head, &msg->list);
+        list_add_tail(&msg->list, &dev->ctl_outgoing_head);
         spin_unlock(&dev->lock);
         wake_up_interruptible(&dev->ctl_outgoing_wait);
     }

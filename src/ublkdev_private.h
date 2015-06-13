@@ -79,6 +79,9 @@ struct ubd_incoming_message {
  *  endpoint.
  */
 struct ublkdev {
+    /** List structure for putting this in a linked list. */
+    struct list_head list;
+    
     /** Disk structure for this block device.
      *
      *  If NULL, a block device has not yet been registered.
