@@ -492,6 +492,8 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 {
     struct ublkdev *dev = filp->private_data;
 
+    printk(KERN_DEBUG "ubd: ioctl(%u, 0x%lx)\n", cmd, data);
+
     BUG_ON(dev == NULL);
 
     switch (cmd) {
@@ -525,11 +527,16 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         struct list_head *iter;
         size_t count = 0;
 
+        printk(KERN_DEBUG "ubd: UBD_IOCGETCOUNT -- locking ubd_devices\n");
+
         spin_lock(&ubd_devices_lock);
         list_for_each(iter, &ubd_devices) {
             ++count;
         }
         spin_unlock(&ubd_devices_lock);
+
+        printk(KERN_DEBUG "ubd: UBD_IOCGETCOUNT -- found %zu devices\n",
+               count);
         return count;
     }
 
