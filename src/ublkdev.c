@@ -6,7 +6,6 @@
 #include <linux/blkdev.h>
 #include <linux/fs.h>
 #include <linux/init.h>
-#include <linux/kthread.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/poll.h>
@@ -64,6 +63,15 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *message);
 
 /** Register a disk with the control endpoint. */
 static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info);
+
+/** Unregister a disk from the control endpoint. */
+static int ubdctl_unregister(struct ublkdev *dev);
+
+/** Unregister a disk from the control endpoint.
+ *
+ *  This variant assumes the spinlock for the device is already held.
+ */
+static int ubdctl_unregister_nolock(struct ublkdev *dev);
 
 /** Control endpoint file operations. */
 static struct file_operations ubdctl_fops = {
@@ -207,7 +215,6 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
 
     /* Initialize the structure. */
     dev->disk = NULL;
-    dev->status = UBD_STATUS_IDLE;
     spin_lock_init(&dev->lock);
     INIT_LIST_HEAD(&dev->ctl_outgoing_head);
     dev->ctl_current_outgoing = NULL;
@@ -215,17 +222,56 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
     dev->ctl_incoming.n_read = 0;
     dev->ctl_incoming.capacity = UBD_INITIAL_MESSAGE_CAPACITY;
     dev->blk_pending = NULL;
-    dev->thread = NULL;
-    init_completion(&dev->thread_complete);
+    dev->status = 0;
+    init_waitqueue_head(&dev->status_wait);
+    dev->flags = 0;
     
     return 0;
 }
 
 static int ubdctl_release(struct inode *inode, struct file *filp) {
+    int result;
+    
     if (filp->private_data != NULL) {
         struct ublkdev *dev = filp->private_data;
 
-        /* FIXME: Implement */
+        spin_lock(&dev->lock);
+        /* This can't be closed while in a transitory state. */
+        while ((dev->status & UBD_STATUS_TRANSIENT) != 0) {
+            spin_unlock(&dev->lock);
+            if (wait_event_interruptible(
+                    dev->status_wait,
+                    (dev->status & UBD_STATUS_TRANSIENT) == 0))
+            {
+                /* Interrupted while waiting. */
+                return -ERESTARTSYS;
+            }
+            spin_lock(&dev->lock);
+        }
+
+        /* Are we running? */
+        if ((dev->status & UBD_STATUS_RUNNING) != 0) {
+            /* Yes; unregister the device */
+            if ((result = ubdctl_unregister_nolock(dev)) != 0) {
+                spin_unlock(&dev->lock);
+                return result;
+            }
+
+            /* Wait for the device to become idle again. */
+            while (dev->status != 0) {
+                spin_unlock(&dev->lock);
+                if (wait_event_interruptible(dev->status_wait,
+                                             dev->status == 0))
+                {
+                    /* Interrupted while waiting. */
+                    spin_unlock(&dev->lock);
+                    return -ERESTARTSYS;
+                }
+            }
+        }
+
+        /* We should now be ok to release the structure. */
+        BUG_ON(dev->status != 0);
         kfree(dev);
         filp->private_data = NULL;
     }
@@ -469,7 +515,7 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
     }
 
     case UBD_IOCUNREGISTER: {
-        break;
+        return ubdctl_unregister(dev);
     }
 
     case UBD_IOCGETCOUNT: {
@@ -605,7 +651,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
     /* Make sure we haven't already registered a disk on this control
        endpoint */
-    if (dev->status != UBD_STATUS_IDLE) {
+    if (dev->status != 0) {
         printk(KERN_DEBUG "ubd: attempted to register duplicate device\n");
         result = -EBUSY;
         goto done;
@@ -643,12 +689,14 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     memcpy(disk->disk_name, name, DISK_NAME_LEN);
     disk->fops = &ubdblk_fops;
     disk->queue = dev->blk_pending;
-    disk->flags = (info->ubd_flags & UBD_FL_REMOVABLE) ? GENHD_FL_REMOVABLE : 0;
+    disk->flags =
+        (info->ubd_flags & UBD_FL_REMOVABLE) ? GENHD_FL_REMOVABLE : 0;
     set_capacity(disk, info->ubd_nsectors);
     disk->private_data = dev;
 
     /* Register the request handler */
     dev->blk_pending = blk_init_queue(ubdblk_handle_request, &dev->lock);
+    dev->blk_pending->queuedata = dev;
 
     /* XXX: We only support one segment at a time for now. */
     blk_queue_max_segments(dev->blk_pending, 1);
@@ -659,12 +707,82 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
     /* Mark this device as registering */
     dev->status = UBD_STATUS_REGISTERING;
+    wake_up_interruptible(&dev->status_wait);
     dev->flags = info->ubd_flags;
     result = 0;
 
 done:
     spin_unlock(&dev->lock);
     return result;
+}
+
+
+static int ubdctl_unregister(struct ublkdev *dev) {
+    int result;
+    
+    spin_lock(&dev->lock);
+    result = ubdctl_unregister_nolock(dev);
+    spin_lock(&dev->lock);
+
+    return result;
+}
+
+
+static int ubdctl_unregister_nolock(struct ublkdev *dev) {
+    if ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
+        /* Can't unregister a device coming up. */
+        printk(KERN_INFO "ubd: attempted to unregister a device in a "
+               "transient state.\n");
+        return -EBUSY;
+    }
+
+    if ((dev->status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
+        /* Device isn't running. */
+        printk(KERN_INFO "ubd: attempted to unregister a non-running "
+               "device.\n");
+        return -EINVAL;
+    }
+
+    dev->status &= ~UBD_STATUS_RUNNING;
+    dev->status |= UBD_STATUS_UNREGISTERING;
+    wake_up_interruptible(&dev->status_wait);
+
+    /* Are we serving traffic? */
+    if ((dev->status & UBD_STATUS_OPENED) != 0) {
+        /* Reply to all pending messages. */
+        blk_queue_invalidate_tags(dev->blk_pending);
+
+        /* Wait for the device to be unmounted. */
+        while ((dev->status & UBD_STATUS_OPENED) != 0) {
+            int wait_result;
+            
+            spin_unlock(&dev->lock);
+            wait_result = wait_event_interruptible(
+                dev->status_wait,
+                (dev->status & UBD_STATUS_OPENED) == 0);
+            spin_lock(&dev->lock);
+
+            if (wait_result != 0) {
+                /* Interrupted; we can pick up again, so leave the device in
+                   the unregistering state. */
+                return -ERESTARTSYS;
+            }
+        }
+    }
+
+    BUG_ON((dev->status & UBD_STATUS_OPENED) != 0);
+
+    /* Stop the disk. */
+    del_gendisk(dev->disk);
+
+    /* Clean up the disk structure */
+    dev->flags = 0;
+    dev->status = 0;
+    blk_cleanup_queue(dev->blk_pending);
+    dev->blk_pending = NULL;
+    dev->disk = NULL;
+
+    return 0;
 }
 
 
@@ -719,16 +837,20 @@ static void ubdblk_add_disk(struct work_struct *work) {
 
     BUG_ON(dev == NULL);
 
+    /* Go from registering to running+adding */
     spin_lock(&dev->lock);
     BUG_ON(dev->status != UBD_STATUS_REGISTERING);
-    dev->status = UBD_STATUS_ADDING_RUNNING;
-    spin_unlock(&dev->lock);
-    
-    add_disk(dev->disk);
+    dev->status = (UBD_STATUS_ADDING | UBD_STATUS_RUNNING);
+    wake_up_interruptible(&dev->status_wait);
 
+    /* Add the disk to the system. */
+    spin_unlock(&dev->lock);
+    add_disk(dev->disk);
     spin_lock(&dev->lock);
-    BUG_ON(dev->status != UBD_STATUS_ADDING_RUNNING);
-    dev->status = UBD_STATUS_RUNNING;
+
+    /* Go from running+adding to just running */
+    dev->status &= ~UBD_STATUS_ADDING;
+    wake_up_interruptible(&dev->status_wait);
     spin_unlock(&dev->lock);
 
     return;
@@ -736,14 +858,23 @@ static void ubdblk_add_disk(struct work_struct *work) {
 
 
 static void ubdblk_handle_request(struct request_queue *rq) {
-    struct ublkdev *dev;
+    struct ublkdev *dev = rq->queuedata;
+    int is_running;
     struct request *req;
-    
+
+    spin_lock(&dev->lock);
+    is_running = ((dev->status & UBD_STATUS_RUNNING) != 0);
+    spin_unlock(&dev->lock);
+
     while ((req = blk_fetch_request(rq)) != NULL) {
+        if (unlikely(! is_running)) {
+            /* Device is not running; fail the request. */
+            blk_end_request_err(req, -EIO);
+            continue;            
+        }
+        
         spin_unlock_irq(rq->queue_lock);
 
-        dev = req->rq_disk->private_data;
-        
         switch (req->cmd_type) {
             case REQ_TYPE_FS:
             ubdblk_handle_fs_request(dev, req);

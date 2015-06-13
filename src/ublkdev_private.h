@@ -17,23 +17,39 @@
 /** Initial capacity for holding an incoming message. */
 #define UBD_INITIAL_MESSAGE_CAPACITY        ((size_t) (128u << 10)) /* 128 kB */
 
-/** Status: Not registered */
-#define UBD_STATUS_IDLE             0
-
-/** Status: Waiting for add_disk to be called */
-#define UBD_STATUS_REGISTERING      1
-
-/** Status: Running, but add_disk() hasn't returned.
+/** Status: Registering; waiting for add_disk() call to start.
  *
- *  The disk can't be unregistered in this state.
+ *  Cannot be combined with any other flags.
  */
-#define UBD_STATUS_ADDING_RUNNING   2
+#define UBD_STATUS_REGISTERING      0x01
 
-/** Status: Running. */
-#define UBD_STATUS_RUNNING          3
+/** Status: Add disk call in progress.
+ *
+ *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_UNREGISTERING.
+ */
+#define UBD_STATUS_ADDING           0x02
 
-/** Status: Unregistiering -- waiting for commands to finish */
-#define UBD_STATUS_UNREGISTERING    4
+/** Status: Running.
+ *
+ *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_UNREGISTERING.
+ */
+#define UBD_STATUS_RUNNING          0x04
+
+/** Status: Unregistiering -- waiting for commands to finish.
+ *
+ *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_RUNNING.
+ */
+#define UBD_STATUS_UNREGISTERING    0x08
+
+/** Status: Block device opened.
+ *
+ *  Cannot be combined with UBD_STATUS_REGISTERING.
+ */
+#define UBD_STATUS_OPENED           0x10
+
+/** Indicates that the device is in a transitory state. */
+#define UBD_STATUS_TRANSIENT \
+    (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING | UBD_STATUS_UNREGISTERING)
 
 /** Wraps a UBD message in a Linux linked list.
  */
@@ -81,7 +97,8 @@ struct ublkdev {
     /** Message currently being written. */
     struct ubd_outgoing_message *ctl_current_outgoing;
 
-    /** Wait queue for notifying ubdctl_read when a new message is available. */
+    /** Wait queue for notifying ubdctl_read when a new message is available.
+     */
     wait_queue_head_t ctl_outgoing_wait;
 
     /** Pending message being read from the control endpoint. */
@@ -90,14 +107,11 @@ struct ublkdev {
     /** A list of requests waiting to be handled or replied to. */
     struct request_queue *blk_pending;
 
-    /** The thread for handling block device requests. */
-    struct task_struct *thread;
-
-    /** Indicates completion of the thread. */
-    struct completion thread_complete;
-
-    /** Status of this device */
+    /** Status of this device.  The lock must be held to read or write this. */
     uint32_t status;
+
+    /** Wait queue for notifying anyone waiting on a status change. */
+    wait_queue_head_t status_wait;
 
     /** Flags passed when registering. */
     uint32_t flags;
