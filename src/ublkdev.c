@@ -441,8 +441,8 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
         spin_unlock(&dev->lock);
 
         if (n_read > 0) {
-            /* Can't return EFAULT here -- we're already read part of the buffer
-               to get at the header. */
+            /* Can't return EFAULT here -- we're already read part of the
+               buffer to get at the header. */
             return n_read;
         } else {
             return -EFAULT;
@@ -501,11 +501,17 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         struct ubd_info info;
         long result;
 
+        printk(KERN_DEBUG "ubd: UBD_IOCREGISTER -- copying structures from "
+               "userspace\n");
+        
         /* Get the disk info from userspace. */
         if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
             printk(KERN_DEBUG "ubd: invalid userspace address\n");
             return -EFAULT;
         }
+
+        printk(KERN_DEBUG "ubd: info: ubd_name=\"%.8s\", ubd_flags=0x%x, ubd_nsectors=%lu, ubd_major=%ud, ubd_minor=%ud\n", info.ubd_name, info.ubd_flags, info.ubd_nsectors, info.ubd_major, info.ubd_minor);
+        printk(KERN_DEBUG "ubd: registering device\n");
 
         result = ubdctl_register(dev, &info);
         if (result == 0) {
@@ -712,6 +718,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     int major;
     int result = -EINVAL;
 
+    printk(KERN_DEBUG "ubdctl_register: locking spinlock\n");
     spin_lock(&dev->lock);
 
     /* Make sure we haven't already registered a disk on this control
@@ -722,11 +729,15 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
         goto done;
     }
 
+    printk(KERN_DEBUG "faulting if dev->disk is non-NULL\n");
     BUG_ON(dev->disk != NULL);
+    printk(KERN_DEBUG "dev->disk is null\n");
 
     /* Make sure the name is NUL terminated. */
     memcpy(name, info->ubd_name, DISK_NAME_LEN);
     name[DISK_NAME_LEN] = '\0';
+
+    printk(KERN_DEBUG "disk_name is %s\n", name);
 
     /* Register the block device. */
     if ((major = register_blkdev(0, name)) < 0) {
@@ -738,6 +749,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     }
 
     info->ubd_major = (uint32_t) major;
+    printk(KERN_DEBUG "major is %ud\n", (unsigned int) major);
 
     /* Allocate a disk structure. */
     /* FIXME: Allow users to register more than 1 minor. */
@@ -746,6 +758,8 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
         result = -ENOMEM;
         goto done;
     }
+
+    printk(KERN_DEBUG "disk structure allocated\n");
 
     /* Fill in the disk structure. */
     disk->major = major;
@@ -759,12 +773,16 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     set_capacity(disk, info->ubd_nsectors);
     disk->private_data = dev;
 
+    printk(KERN_DEBUG "inializing request queue\n");
+
     /* Register the request handler */
     dev->blk_pending = blk_init_queue(ubdblk_handle_request, &dev->lock);
     dev->blk_pending->queuedata = dev;
 
     /* XXX: We only support one segment at a time for now. */
     blk_queue_max_segments(dev->blk_pending, 1);
+
+    printk(KERN_DEBUG "scheduling worker to add_disk()\n");
 
     /* Add the disk after this method returns. */
     INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
@@ -776,10 +794,14 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     dev->flags = info->ubd_flags;
     result = 0;
 
+    printk(KERN_DEBUG "adding this struct to the list of devices\n");
+
     /* Add this to the list of registered disks. */
     spin_lock(&ubd_devices_lock);
     list_add_tail(&dev->list, &ubd_devices);
     spin_unlock(&ubd_devices_lock);
+
+    printk(KERN_DEBUG "done, releasing device spinlock\n");
 
 done:
     spin_unlock(&dev->lock);
