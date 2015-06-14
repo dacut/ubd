@@ -515,13 +515,17 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 
         result = ubdctl_register(dev, &info);
         if (result == 0) {
+            printk(KERN_DEBUG "ubd: register call succeeded; copying results back to userspace\n");
             /* Copy the disk info back to userspace. */
             if (copy_to_user((void *) data, &info, sizeof(info)) != 0) {
                 printk(KERN_ERR "ubd: userspace address became invalid\n");
                 return -EFAULT;
             }
+        } else {
+            printk(KERN_DEBUG "ubd: register call failed.\n");
         }
 
+        printk(KERN_DEBUG "ubd: returning %ld\n", result);
         return result;
     }
 
@@ -776,7 +780,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     printk(KERN_DEBUG "inializing request queue\n");
 
     /* Register the request handler */
-    dev->blk_pending = blk_init_queue(ubdblk_handle_request, &dev->lock);
+    dev->blk_pending = blk_init_queue(ubdblk_handle_request, NULL);
     dev->blk_pending->queuedata = dev;
 
     /* XXX: We only support one segment at a time for now. */
