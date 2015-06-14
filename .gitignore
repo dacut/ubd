@@ -7,3 +7,5 @@ Module.symvers
 .tmp_versions
 *.cmd
 *.ko
+*.pyc
+
