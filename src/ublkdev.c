@@ -855,7 +855,7 @@ static int ubdctl_unregister(struct ublkdev *dev) {
 
     spin_lock(&dev->lock);
     result = ubdctl_unregister_nolock(dev);
-    spin_lock(&dev->lock);
+    spin_unlock(&dev->lock);
 
     return result;
 }
