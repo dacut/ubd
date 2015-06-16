@@ -98,12 +98,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info);
 /** Unregister a disk from the control endpoint. */
 static int ubdctl_unregister(struct ublkdev *dev);
 
-/** Unregister a disk from the control endpoint.
- *
- *  This variant assumes the spinlock for the device is already held.
- */
-static int ubdctl_unregister_nolock(struct ublkdev *dev);
-
 /** Control endpoint file operations. */
 static struct file_operations ubdctl_fops = {
     .owner = THIS_MODULE,
@@ -289,12 +283,12 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
         /* Are we running? */
         while ((dev->status & UBD_STATUS_RUNNING) != 0) {
             /* Yes; unregister the device */
-            if ((result = ubdctl_unregister_nolock(dev)) != 0) {
+            spin_unlock(&dev->lock);
+            if ((result = ubdctl_unregister(dev)) != 0) {
                 if (result == -EBUSY) {
                     printk(KERN_INFO "[%d] ubdctl_release: failed to "
                            "unregister device: still busy; will retry.\n",
                            current->pid);
-                    spin_unlock(&dev->lock);
                     schedule();
                     spin_lock(&dev->lock);
                     continue;
@@ -302,13 +296,13 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
                     printk(KERN_ERR "[%d] ubdctl_release: failed to "
                            "unregister device: error=%d\n", current->pid,
                            -result);
-                    spin_unlock(&dev->lock);
                     return result;
                 }
             }
         }
         
         /* We should now be ok to release the structure. */
+        
         BUG_ON(dev->status != 0);
         spin_unlock(&dev->lock);
         kfree(dev);
@@ -407,7 +401,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     BUG_ON(dev == NULL);
 
     spin_lock(&dev->lock);
-
     in = &dev->ctl_incoming;
 
     /* Have we read the header yet? */
@@ -530,7 +523,8 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 {
     struct ublkdev *dev = filp->private_data;
 
-    printk(KERN_DEBUG "ubd: ioctl(%u, 0x%lx)\n", cmd, data);
+    printk(KERN_DEBUG "[%d] ubdctl_ioctl: ioctl(%u, 0x%lx)\n",
+           current->pid, cmd, data);
 
     BUG_ON(dev == NULL);
 
@@ -539,43 +533,67 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         struct ubd_info info;
         long result;
 
-        printk(KERN_DEBUG "ubd: UBD_IOCREGISTER -- copying structures from "
-               "userspace\n");
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCREGISTER -- copying "
+               "structures from userspace\n", current->pid);
         
         /* Get the disk info from userspace. */
         if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
-            printk(KERN_DEBUG "ubd: invalid userspace address\n");
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace address\n",
+                   current->pid);
             return -EFAULT;
         }
 
-        printk(KERN_DEBUG "ubd: info: ubd_name=\"%.8s\", ubd_flags=0x%x, ubd_nsectors=%lu, ubd_major=%ud, ubd_minor=%ud\n", info.ubd_name, info.ubd_flags, (unsigned long) info.ubd_nsectors, info.ubd_major, info.ubd_minor);
-        printk(KERN_DEBUG "ubd: registering device\n");
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: ubd_info: ubd_name=\"%.8s\", "
+               "ubd_flags=0x%x, ubd_nsectors=%llu, ubd_major=%ud, "
+               "ubd_minor=%ud\n", current->pid, info.ubd_name, info.ubd_flags,
+               (unsigned long long) info.ubd_nsectors, info.ubd_major,
+               info.ubd_minor);
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: registering device\n",
+               current->pid);
 
         result = ubdctl_register(dev, &info);
         if (result == 0) {
-            printk(KERN_DEBUG "ubd: register call succeeded; copying results back to userspace\n");
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: register call succeeded; "
+                   "copying results back to userspace\n", current->pid);
             /* Copy the disk info back to userspace. */
             if (copy_to_user((void *) data, &info, sizeof(info)) != 0) {
-                printk(KERN_ERR "ubd: userspace address became invalid\n");
+                printk(KERN_ERR "[%d] ubdctl_ioctl: userspace address became "
+                       "invalid\n", current->pid);
                 return -EFAULT;
             }
         } else {
-            printk(KERN_DEBUG "ubd: register call failed.\n");
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: register call failed; "
+                   "errno=%d.\n", current->pid, (int) -result);
         }
 
-        printk(KERN_DEBUG "ubd: returning %ld\n", result);
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: returning %ld\n", current->pid,
+               result);
         return result;
     }
 
     case UBD_IOCUNREGISTER: {
-        return ubdctl_unregister(dev);
+        long result;
+        
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCUNREGISTER\n",
+               current->pid);
+        result = ubdctl_unregister(dev);
+        if (result == 0) {
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: unregister succeeded.\n",
+                   current->pid);
+        } else {
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: unregister call failed; "
+                   "errno=%d\n", current->pid, (int) -result);
+        }
+
+        return result;
     }
 
     case UBD_IOCGETCOUNT: {
         struct list_head *iter;
         size_t count = 0;
 
-        printk(KERN_DEBUG "ubd: UBD_IOCGETCOUNT -- locking ubd_devices\n");
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT\n",
+               current->pid);
 
         spin_lock(&ubd_devices_lock);
         list_for_each(iter, &ubd_devices) {
@@ -583,8 +601,8 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         }
         spin_unlock(&ubd_devices_lock);
 
-        printk(KERN_DEBUG "ubd: UBD_IOCGETCOUNT -- found %zu devices\n",
-               count);
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT -- found %zu "
+               "devices\n", current->pid, count);
         return count;
     }
 
@@ -593,9 +611,13 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         struct list_head *iter;
         size_t index = 0;
 
+        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCDESCRIBE\n",
+               current->pid);
+
         /* Get the describe structure from userspace. */
         if (copy_from_user(&desc, (void *) data, sizeof(desc)) != 0) {
-            printk(KERN_DEBUG "ubd: invalid userspace address\n");
+            printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace address\n",
+                current->pid);
             return -EFAULT;
         }
 
@@ -629,7 +651,8 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
             spin_unlock(&dev->lock);
 
             if (copy_to_user((void *) data, &desc, sizeof(desc)) != 0) {
-                printk(KERN_DEBUG "ubd: invalid userspace address\n");
+                printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace "
+                       "address\n", current->pid);
                 return -EFAULT;
             }
 
@@ -651,50 +674,56 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     struct bio_vec bvec;
     struct req_iterator iter;
     struct request *rq;
+    uint32_t tag;
     uint32_t msgtype = reply->ubd_header.ubd_msgtype;
     uint32_t size = size;
 
     /* Make sure the message type and size are sensical. */
     if (msgtype == UBD_MSGTYPE_READ_REPLY) {
         if (size < offsetof(struct ubd_reply, ubd_data)) {
-            printk(KERN_INFO "ubd: received invalid read reply packet with "
-                   "size %u (minimum is %zu)\n", size,
-                   offsetof(struct ubd_reply, ubd_data));
+            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid read "
+                   "reply packet with size %u (minimum is %zu)\n",
+                   current->pid, size, offsetof(struct ubd_reply, ubd_data));
             return;
         }
 
         /* Make sure the size of the data is on a sector boundary. */
         if ((size - offsetof(struct ubd_reply, ubd_data)) % 512 != 0) {
-            printk(KERN_INFO "ubd: received invalid read reply packet with "
-                   "size %u (not a sector-sized reply)\n", size);
+            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid read "
+                   "reply packet with size %u (not a sector-sized reply)\n",
+                   current->pid, size);
             return;
         }
     } else if (msgtype == UBD_MSGTYPE_WRITE_REPLY) {
         if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_INFO "ubd: received invalid write reply packet with "
-                   "size %u (expected %zu)\n", size, sizeof(struct ubd_reply));
+            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid "
+                   "write reply packet with size %u (expected %zu)\n",
+                   current->pid, size, sizeof(struct ubd_reply));
             return;
         }
     } else if (msgtype == UBD_MSGTYPE_DISCARD_REPLY) {
         if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_INFO "ubd: received invalid discard reply packet "
-                   "with size %u (expected %zu)\n", size,
-                   sizeof(struct ubd_reply));
+            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid "
+                   "discard reply packet with size %u (expected %zu)\n",
+                   current->pid, size, sizeof(struct ubd_reply));
             return;
         }
     } else {
-        printk(KERN_INFO "ubd: received invalid reply type 0x%x\n", msgtype);
+        printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid reply "
+               "type 0x%x\n", current->pid, msgtype);
         return;
     }
 
+    tag = reply->ubd_header.ubd_tag;
+    
     spin_lock(&dev->lock);
 
     /* Find the request this belongs to. */
-    rq = blk_queue_find_tag(dev->blk_pending, reply->ubd_header.ubd_tag);
+    rq = blk_queue_find_tag(dev->blk_pending, tag);
     if (rq == NULL) {
         spin_unlock(&dev->lock);
-        printk(KERN_INFO "ubd: received reply for unknown tag %u\n",
-               reply->ubd_header.ubd_tag);
+        printk(KERN_INFO "[%d] ubdctl_handle_reply: received reply for "
+               "unknown tag %u\n", current->pid, tag);
         return;
     }
 
@@ -709,8 +738,9 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
             blk_end_request_err(rq, reply->ubd_status);
         } else if (reply->ubd_status != n_sectors) {
             /* Sector count mismatch. */
-            printk(KERN_INFO "ubd: expected %u sectors; received %u "
-                   "sectors.\n", n_sectors, reply->ubd_status);
+            printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u sectors; "
+                   "received %u sectors.\n", current->pid, n_sectors,
+                   reply->ubd_status);
             blk_end_request_err(rq, -EIO);
         } else if (bio_data_dir(bio) == READ) {
             /* Read request */
@@ -719,11 +749,13 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
 
             if (msgtype != UBD_MSGTYPE_READ_REPLY) {
                 /* Reply type doesn't match what was requested. */
-                printk(KERN_INFO "ubd: expected read reply packet.\n");
+                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected read "
+                       "reply packet for tag %u.\n", current->pid, tag);
                 blk_end_request_err(rq, -EIO);
             } else if (recv_data != 512 * n_sectors) {
                 /* Reply size does not match the requested size. */
-                printk(KERN_INFO "ubd: expected %u bytes; received %u bytes.\n",
+                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u "
+                       "bytes; received %u bytes.\n", current->pid,
                        512 * n_sectors, recv_data);
                 blk_end_request_err(rq, -EIO);
             } else {
@@ -733,14 +765,16 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
             }
         } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
             if (msgtype != UBD_MSGTYPE_DISCARD_REPLY) {
-                printk(KERN_INFO "ubd: expected discard reply packet.\n");
+                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected discard "
+                       "reply packet for tag %u.\n", current->pid, tag);
                 blk_end_request_err(rq, -EIO);
             } else {
                 blk_end_request(rq, 0, 0);
             }
         } else {
             if (msgtype != UBD_MSGTYPE_WRITE_REPLY) {
-                printk(KERN_INFO "ubd: expected write reply packet.\n");
+                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected write "
+                       "reply packet for tag %u.\n", current->pid, tag);
                 blk_end_request_err(rq, -EIO);
             } else {
                 blk_end_request(rq, 0, 0);
@@ -863,29 +897,22 @@ done:
 
 
 static int ubdctl_unregister(struct ublkdev *dev) {
-    int result;
+    BUG_ON(dev == NULL);
 
     spin_lock(&dev->lock);
-    result = ubdctl_unregister_nolock(dev);
-    spin_unlock(&dev->lock);
-
-    return result;
-}
-
-
-static int ubdctl_unregister_nolock(struct ublkdev *dev) {
-    BUG_ON(dev == NULL);
     
     if ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
         /* Can't unregister a device coming up. */
-        printk(KERN_INFO "[%d] ubdctl_unregister_nolock: attempted to "
+        spin_unlock(&dev->lock);
+        printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a device in a transient state.\n", current->pid);
         return -EBUSY;
     }
 
     if ((dev->status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
         /* Device isn't running. */
-        printk(KERN_INFO "[%d] ubdctl_unregister_nolock: attempted to "
+        spin_unlock(&dev->lock);
+        printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a non-running device.\n", current->pid);
         return -EINVAL;
     }
@@ -898,13 +925,13 @@ static int ubdctl_unregister_nolock(struct ublkdev *dev) {
     if ((dev->status & UBD_STATUS_OPENED) != 0) {
         struct request *req;
         
-        printk(KERN_DEBUG "[%d] ubdctl_unregister_nolock: unregistering an "
+        printk(KERN_DEBUG "[%d] ubdctl_unregister: unregistering an "
                "open device\n", current->pid);
         
         /* Reply to all pending messages. */
+        spin_unlock(&dev->lock);
         blk_queue_invalidate_tags(dev->blk_pending);
 
-        spin_unlock(&dev->lock);
         spin_lock(dev->blk_pending->queue_lock);
         while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
             spin_unlock(dev->blk_pending->queue_lock);
@@ -932,29 +959,28 @@ static int ubdctl_unregister_nolock(struct ublkdev *dev) {
         }
     }
 
-    printk(KERN_DEBUG "[%d] ubdctl_unregister_nolock: device closed, stopping "
+    printk(KERN_DEBUG "[%d] ubdctl_unregister: device closed, stopping "
            "disk.\n", current->pid);
     BUG_ON((dev->status & UBD_STATUS_OPENED) != 0);
-
-    /* Stop the disk.  We need to temporarily release the lock here in case
-       someone (systemd, cough cough) attempted to open the disk since we
-       cleared the request queue. */
     spin_unlock(&dev->lock);
-    del_gendisk(dev->disk);
-    spin_lock(&dev->lock);
 
-    printk(KERN_DEBUG "[%d] ubdctl_unregister_nolock: disk stopped; cleaning "
+    /* Stop the disk. */
+    del_gendisk(dev->disk);
+
+    printk(KERN_DEBUG "[%d] ubdctl_unregister: disk stopped; cleaning "
            "queue\n", current->pid);
+    blk_cleanup_queue(dev->blk_pending);
 
     /* Clean up the disk structure */
+    spin_lock(&dev->lock);
     dev->flags = 0;
     dev->status = 0;
-    blk_cleanup_queue(dev->blk_pending);
     dev->blk_pending = NULL;
     dev->disk = NULL;
+    spin_unlock(&dev->lock);
 
-    printk(KERN_DEBUG "[%d] ubdctl: queue cleaned; removing device from list "
-           "of devices\n", current->pid);
+    printk(KERN_DEBUG "[%d] ubdctl_unregister: queue cleaned; "
+           "removing device from list of devices\n", current->pid);
 
     /* Remove this disk structure from the list of devices. */
     spin_lock(&ubd_devices_lock);
@@ -1031,6 +1057,8 @@ static int ubdblk_ioctl(struct block_device *blkdev, fmode_t mode,
                         unsigned int cmd, unsigned long data)
 {
     /* FIXME: Implement ioctls */
+    printk(KERN_ERR "[%d] ubdblk_ioctl: unknown ioctl %u\n", current->pid,
+           cmd);
     return -EINVAL;
 }
 
@@ -1051,30 +1079,31 @@ static int ubdblk_revalidate_disk(struct gendisk *gd) {
 static void ubdblk_add_disk(struct work_struct *work) {
     struct ublkdev *dev = container_of(work, struct ublkdev, add_disk_work);
 
-    printk(KERN_DEBUG "ubdblk_add_disk: dev=%p\n", dev);
+    printk(KERN_DEBUG "[%d] ubdblk_add_disk: dev=%p\n", current->pid, dev);
     BUG_ON(dev == NULL);
 
-    printk(KERN_DEBUG "ubdblk_add_disk: locking device\n");
     /* Go from registering to running+adding */
     spin_lock(&dev->lock);
 
-    printk(KERN_DEBUG "ubdblk_add_disk: asserting current state\n");
+    printk(KERN_DEBUG "[%d] ubdblk_add_disk: asserting current state\n",
+           current->pid);
     BUG_ON(dev->status != UBD_STATUS_REGISTERING);
     dev->status = (UBD_STATUS_ADDING | UBD_STATUS_RUNNING);
     wake_up_interruptible(&dev->status_wait);
 
     /* Add the disk to the system. */
     spin_unlock(&dev->lock);
-    printk(KERN_DEBUG "ubdblk_add_disk: calling add_disk\n");
+    printk(KERN_DEBUG "[%d] ubdblk_add_disk: calling add_disk\n",
+           current->pid);
     add_disk(dev->disk);
     spin_lock(&dev->lock);
-
-    printk(KERN_DEBUG "ubdblk_add_disk: add_disk returned; spin lock reacquired\n");
 
     /* Go from running+adding to just running */
     dev->status &= ~UBD_STATUS_ADDING;
     wake_up_interruptible(&dev->status_wait);
     spin_unlock(&dev->lock);
+
+    printk(KERN_DEBUG "[%d] ubdblk_add_disk: done\n", current->pid);
 
     return;
 }
