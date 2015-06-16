@@ -97,11 +97,11 @@ struct ubd_request {
     /** Common header */
     struct ubd_header ubd_header;
     
-    /** First sector of the request. */
-    uint64_t ubd_first_sector;
-
     /** Number of 512-byte sectors to read. */
     uint32_t ubd_nsectors;
+
+    /** First sector of the request. */
+    uint64_t ubd_first_sector;
 
     /** Data for this request. */
     char ubd_data[0];

@@ -28,6 +28,8 @@ class UBDDescribe(ctypes.Structure):
         ("ubd_info", UBDInfo),
     ]
 
+class UBDReadRequest(object):
+
 class UserBlockDevice(object):
     def __init__(self, control_endpoint="/dev/ubdctl"):
         super(UserBlockDevice, self).__init__()
