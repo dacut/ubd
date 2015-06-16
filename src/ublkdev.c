@@ -287,12 +287,24 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
         }
 
         /* Are we running? */
-        if ((dev->status & UBD_STATUS_RUNNING) != 0) {
+        while ((dev->status & UBD_STATUS_RUNNING) != 0) {
             /* Yes; unregister the device */
             if ((result = ubdctl_unregister_nolock(dev)) != 0) {
-                printk(KERN_ERR "ubdctl_release: failed to unregister device: error=%d\n", -result);
-                spin_unlock(&dev->lock);
-                return result;
+                if (result == -EBUSY) {
+                    printk(KERN_INFO "[%d] ubdctl_release: failed to "
+                           "unregister device: still busy; will retry.\n",
+                           current->pid);
+                    spin_unlock(&dev->lock);
+                    schedule();
+                    spin_lock(&dev->lock);
+                    continue;
+                } else {
+                    printk(KERN_ERR "[%d] ubdctl_release: failed to "
+                           "unregister device: error=%d\n", current->pid,
+                           -result);
+                    spin_unlock(&dev->lock);
+                    return result;
+                }
             }
         }
         
