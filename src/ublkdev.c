@@ -213,6 +213,13 @@ static struct block_device_operations ubdblk_fops = {
 static int __init ubd_init(void) {
     int result;
 
+    printk(KERN_INFO "ubd_reply: header at 0x%zx (0x%zx bytes)\n",
+           offsetof(struct ubd_reply, ubd_header), sizeof(struct ubd_header));
+    printk(KERN_INFO "ubd_reply: status at 0x%zx\n",
+           offsetof(struct ubd_reply, ubd_status));
+    printk(KERN_INFO "ubd_reply: data at 0x%zx\n",
+           offsetof(struct ubd_reply, ubd_data));
+
     /* Register the control endpoint */
     if ((result = misc_register(&ubdctl_miscdevice)) < 0) {
         printk(KERN_ERR "[%d] ubdctl failed to register misc device: "
@@ -586,17 +593,45 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 
     /* Have we read the entire message? */
     if (in->n_read == in->reply->ubd_header.ubd_size) {
+        char buffer[320];
+        char *p;
+        unsigned int i;
+        
         /* Yep; parse it. */
         printk(KERN_DEBUG "[%d] ubdctl_write: packet complete; processing.\n",
                current->pid);
+
+        #if 0
+        /* Show the received packet. */
+        p = buffer;
+        for (i = 0; i < in->reply->ubd_header.ubd_size; i += 16) {
+            int j, max_j;
+
+            p += sprintf(p, KERN_DEBUG "[%d] %08x:", current->pid, i);
+            max_j = i + 16;
+            if (max_j > in->reply->ubd_header.ubd_size) {
+                max_j = in->reply->ubd_header.ubd_size;
+            }
+            
+            for (j = i; j < max_j; ++j) {
+                p += sprintf(p, " %02x", ((char *) in->reply)[j]);
+            }
+
+            p += sprintf(p, "\n");
+            printk(buffer);
+        }
+        printk(KERN_DEBUG "[%d] %08x.\n", current->pid,
+               in->reply->ubd_header.ubd_size);
+        #endif
         ubdctl_handle_reply(dev, in->reply);
+        in->n_read = 0;
     } else {
         printk(KERN_DEBUG "[%d] ubdctl_write: packet incomplete: need %u "
                "bytes; have %u bytes.\n", current->pid,
                in->reply->ubd_header.ubd_size, in->n_read);
     }
 
-    dmutex_unlock(&dev->incoming_lock);    
+    dmutex_unlock(&dev->incoming_lock);
     printk(KERN_DEBUG "[%d] ubdctl_write: done\n", current->pid);
     return n_read;
 }

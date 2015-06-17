@@ -123,7 +123,7 @@ class UBDReply(UBDHeader):
             struct.pack(UBDHeader.format, self.msgtype, self.size, self.tag) +
             struct.pack(UBDReply.format, self.status) +
             self.data)
-        
+
         os.write(fd, payload)
         return
 
