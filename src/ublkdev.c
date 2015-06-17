@@ -433,8 +433,6 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
     if (n_to_write > n_pending) {
         n_to_write = n_pending;
     }
-    printk(KERN_DEBUG "[%d] ubdctl_read: will write %zu bytes.\n", current->pid,
-           n_to_write);
 
     if (copy_to_user(buffer, ((char *) out->request) + out->n_written,
                      n_to_write) != 0)
@@ -476,18 +474,11 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 
     BUG_ON(dev == NULL);
 
-    printk(KERN_DEBUG "[%d] ubdctl_write: Receiving %zu bytes; currently have "
-           "%u bytes in message.\n", current->pid, size,
-           dev->ctl_incoming.n_read);
-
     if (dmutex_lock_interruptible(&dev->incoming_lock)) {
         return -ERESTARTSYS;
     }
     
     in = &dev->ctl_incoming;
-
-    printk(KERN_DEBUG "[%d] ubdctl_write: reply buffer is at %p and has %u "
-           "bytes of capacity.\n", current->pid, in->reply, in->capacity);
 
     /* Have we read the header yet? */
     if (in->n_read < sizeof(struct ubd_header)) {
@@ -502,9 +493,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 
         rptr = ((char *) in->reply) + in->n_read;
         
-        printk(KERN_DEBUG "[%d] ubdctl_write: reading %zd header bytes into %p.\n",
-               current->pid, n_to_read, rptr);
-
         /* Do the move from userspace into kernelspace. */
         if (copy_from_user(rptr, buffer, n_to_read) != 0) {
             /* Failed -- userspace address isn't valid. */
@@ -530,9 +518,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
                    current->pid);
             return n_read;
         }
-
-        printk(KERN_DEBUG "[%d] ubdctl_write: packet size is %u bytes.\n",
-               current->pid, in->reply->ubd_header.ubd_size);
 
         /* Yes; is the size sensical?  If so, do we have enough capacity? */
         if (in->reply->ubd_header.ubd_size <= UBD_MAX_MESSAGE_SIZE) {
@@ -567,8 +552,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     }
 
     n_to_read = in->reply->ubd_header.ubd_size - in->n_read;
-    printk(KERN_DEBUG "[%d] ubdctl_write: %zd bytes to read to complete "
-           "packet.\n", current->pid, n_to_read);
     
     if (n_to_read > size) {
         printk(KERN_DEBUG "[%d] ubdctl_write: only %zu bytes available; "
@@ -809,9 +792,6 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     BUG_ON(dev == NULL);
     BUG_ON(reply == NULL);
 
-    printk(KERN_DEBUG "[%d] ubdctl_handle_reply(dev=%p, reply=%p)\n",
-           current->pid, dev, reply);
-
     status = reply->ubd_status;
     msgtype = reply->ubd_header.ubd_msgtype;
     size = reply->ubd_header.ubd_size;
@@ -863,8 +843,6 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                "unknown tag %u\n", current->pid, tag);
         return;
     }
-
-    printk(KERN_DEBUG "[%d] ubdctl_handle_reply: rq=%p\n", current->pid, rq);
 
     rq_for_each_segment(bvec, rq, iter) {
         struct bio *bio = iter.bio;
