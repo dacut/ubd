@@ -9,6 +9,7 @@
 #include <linux/completion.h>
 #include <linux/genhd.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -88,9 +89,6 @@ struct ublkdev {
      */
     struct gendisk *disk;
 
-    /** Lock for manipulating this data structure. */
-    spinlock_t lock;
-
     /** Work structure for scheduling add_disk() asynchronously. */
     struct work_struct add_disk_work;
 
@@ -104,14 +102,24 @@ struct ublkdev {
      */
     wait_queue_head_t ctl_outgoing_wait;
 
+    /** Lock for ctl_outgoing_head, ctl_current_outgoing. */
+    struct mutex outgoing_lock;
+
     /** Pending message being read from the control endpoint. */
     struct ubd_incoming_message ctl_incoming;
+
+    /** Lock for ctl_incoming */
+    struct mutex incoming_lock;
 
     /** A list of requests waiting to be handled or replied to. */
     struct request_queue *blk_pending;
 
-    /** Status of this device.  The lock must be held to read or write this. */
-    uint32_t status;
+    /** Status of this device.  status_lock must be held to read or write
+        this. */
+    volatile uint32_t status;
+
+    /** Spin lock for changing the status. */
+    struct mutex status_lock;
 
     /** Wait queue for notifying anyone waiting on a status change. */
     wait_queue_head_t status_wait;

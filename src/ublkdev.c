@@ -25,31 +25,75 @@ MODULE_PARM_DESC(ubd_major, "UBD major node");
 
 #define spin_lock(x)                                                    \
     do {                                                                \
-        printk(KERN_DEBUG "[%d] %s %d: spin_lock(%s)\n",                \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN spin_lock(%s)\n",          \
                current->pid, __func__, __LINE__, #x);                   \
         spin_lock(x);                                                   \
+        printk(KERN_DEBUG "[%d] %s %d: END   spin_lock(%s)\n",          \
+               current->pid, __func__, __LINE__, #x);                   \
     } while (0)
 
 #define spin_unlock(x)                                                  \
     do {                                                                \
-        printk(KERN_DEBUG "[%d] %s %d: spin_unlock(%s)\n",              \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN spin_unlock(%s)\n",        \
                current->pid, __func__, __LINE__, #x);                   \
         spin_unlock(x);                                                 \
+        printk(KERN_DEBUG "[%d] %s %d: END   spin_unlock(%s)\n",        \
+               current->pid, __func__, __LINE__, #x);                   \
     } while (0)
 
 #define spin_lock_irq(x)                                                \
     do {                                                                \
-        printk(KERN_DEBUG "[%d] %s %d: spin_lock_irq(%s)\n",            \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN spin_lock_irq(%s)\n",      \
                current->pid, __func__, __LINE__, #x);                   \
         spin_lock_irq(x);                                               \
+        printk(KERN_DEBUG "[%d] %s %d: END   spin_lock_irq(%s)\n",      \
+               current->pid, __func__, __LINE__, #x);                   \
     } while (0)
 
 #define spin_unlock_irq(x)                                              \
     do {                                                                \
-        printk(KERN_DEBUG "[%d] %s %d: spin_unlock_irq(%s)\n",          \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN spin_unlock_irq(%s)\n",    \
                current->pid, __func__, __LINE__, #x);                   \
         spin_unlock_irq(x);                                             \
+        printk(KERN_DEBUG "[%d] %s %d: END  spin_unlock_irq(%s)\n",     \
+               current->pid, __func__, __LINE__, #x);                   \
     } while (0)
+
+#define dmutex_lock(x)                                                  \
+    do {                                                                \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN mutex_lock(%s)\n",         \
+               current->pid, __func__, __LINE__, #x);                   \
+        mutex_lock(x);                                                  \
+        printk(KERN_DEBUG "[%d] %s %d: END   mutex_lock(%s)\n",         \
+               current->pid, __func__, __LINE__, #x);                   \
+    } while (0)
+
+#define dmutex_lock_interruptible(x)                                    \
+    ({                                                                  \
+        int result;                                                     \
+                                                                        \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN mutex_lock_interruptible(%s)\n", \
+               current->pid, __func__, __LINE__, #x);                   \
+        result = mutex_lock_interruptible(x);                           \
+        if (result) {                                                   \
+            printk(KERN_DEBUG "[%d] %s %d: FAIL  mutex_lock_interruptible(%s)\n", \
+                   current->pid, __func__, __LINE__, #x);               \
+        } else {                                                        \
+            printk(KERN_DEBUG "[%d] %s %d: END   mutex_lock_interruptible(%s)\n", \
+                   current->pid, __func__, __LINE__, #x);               \
+        }                                                               \
+        result;                                                         \
+    })
+
+#define dmutex_unlock(x)                                                \
+    do {                                                                \
+        printk(KERN_DEBUG "[%d] %s %d: BEGIN mutex_unlock(%s)\n",       \
+               current->pid, __func__, __LINE__, #x);                   \
+        mutex_unlock(x);                                                \
+        printk(KERN_DEBUG "[%d] %s %d: END   mutex_unlock(%s)\n",       \
+               current->pid, __func__, __LINE__, #x);                   \
+    } while (0)
+
 
 /* ***** Driver global functions and variables. ***** */
 
@@ -57,14 +101,13 @@ MODULE_PARM_DESC(ubd_major, "UBD major node");
 LIST_HEAD(ubd_devices);
 
 /** Lock for ubd_devices. */
-DEFINE_SPINLOCK(ubd_devices_lock);
+DEFINE_MUTEX(ubd_devices_lock);
 
 /** Initialize the driver. */
 static int __init ubd_init(void);
 
 /** Clean up the driver. */
 static void __exit ubd_exit(void);
-
 
 /* ***** Control endpoint functions ***** */
 
@@ -244,15 +287,17 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
 
     /* Initialize the structure. */
     dev->disk = NULL;
-    spin_lock_init(&dev->lock);
     INIT_LIST_HEAD(&dev->ctl_outgoing_head);
     dev->ctl_current_outgoing = NULL;
     init_waitqueue_head(&dev->ctl_outgoing_wait);
+    mutex_init(&dev->outgoing_lock);
     dev->ctl_incoming.n_read = 0;
     dev->ctl_incoming.capacity = UBD_INITIAL_MESSAGE_CAPACITY;
+    mutex_init(&dev->incoming_lock);
     dev->blk_pending = NULL;
     dev->status = 0;
     init_waitqueue_head(&dev->status_wait);
+    mutex_init(&dev->status_lock);
     dev->flags = 0;
 
     return 0;
@@ -266,45 +311,63 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
 
         printk(KERN_DEBUG "ubdctl_release: releasing dev=%p\n", dev);
 
-        spin_lock(&dev->lock);
         /* This can't be closed while in a transitory state. */
+        if (dmutex_lock_interruptible(&dev->status_lock)) {
+            printk(KERN_DEBUG "[%d] ubdctl_release: interrupted\n",
+                   current->pid);
+            return -ERESTARTSYS;
+        }
+        
         while ((dev->status & UBD_STATUS_TRANSIENT) != 0) {
-            spin_unlock(&dev->lock);
-            if (wait_event_interruptible(
-                    dev->status_wait,
-                    (dev->status & UBD_STATUS_TRANSIENT) == 0))
-            {
+            printk(KERN_DEBUG "[%d] ubdctl_release: device in transient "
+                   "state: 0x%x\n", current->pid, dev->status);
+
+            dmutex_unlock(&dev->status_lock);
+            if (wait_event_interruptible(dev->status_wait, dev->status == 0)) {
+                printk(KERN_DEBUG "[%d] ubdctl_release: interrupted\n",
+                       current->pid);
                 /* Interrupted while waiting. */
                 return -ERESTARTSYS;
             }
-            spin_lock(&dev->lock);
+            if (dmutex_lock_interruptible(&dev->status_lock)) {
+                printk(KERN_DEBUG "[%d] ubdctl_release: interrupted\n",
+                       current->pid);
+                return -ERESTARTSYS;
+            }
         }
 
         /* Are we running? */
         while ((dev->status & UBD_STATUS_RUNNING) != 0) {
             /* Yes; unregister the device */
-            spin_unlock(&dev->lock);
             if ((result = ubdctl_unregister(dev)) != 0) {
                 if (result == -EBUSY) {
                     printk(KERN_INFO "[%d] ubdctl_release: failed to "
                            "unregister device: still busy; will retry.\n",
                            current->pid);
+                    dmutex_unlock(&dev->status_lock);
                     schedule();
-                    spin_lock(&dev->lock);
+                    if (dmutex_lock_interruptible(&dev->status_lock)) {
+                        printk(KERN_DEBUG "[%d] ubdctl_relase: interrupted\n",
+                               current->pid);
+                        return -ERESTARTSYS;
+                    }
                     continue;
                 } else {
                     printk(KERN_ERR "[%d] ubdctl_release: failed to "
                            "unregister device: error=%d\n", current->pid,
                            -result);
+                    dmutex_unlock(&dev->status_lock);
                     return result;
                 }
             }
         }
         
         /* We should now be ok to release the structure. */
-        
         BUG_ON(dev->status != 0);
-        spin_unlock(&dev->lock);
+        dmutex_unlock(&dev->status_lock);
+        mutex_destroy(&dev->outgoing_lock);
+        mutex_destroy(&dev->incoming_lock);
+        mutex_destroy(&dev->status_lock);
         kfree(dev);
         filp->private_data = NULL;
     }
@@ -324,25 +387,31 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
 
     BUG_ON(dev == NULL);
 
-    spin_lock(&dev->lock);
-
+    if (dmutex_lock_interruptible(&dev->outgoing_lock)) {
+        return -ERESTARTSYS;
+    }
+    
     while (dev->ctl_current_outgoing == NULL) {
         struct list_head *first_message;
+
+        printk(KERN_DEBUG "[%d] ubdctl_read: no current outgoing message; "
+               "looking for a new one.\n", current->pid);
 
         /* Need to pull a new message off the queue. */
         while (list_empty(& dev->ctl_outgoing_head)) {
             /* No messages; sleep until we have a new one. */
-            spin_unlock(&dev->lock);
+            printk(KERN_DEBUG "[%d] ubdctl_read: queue empty; sleeping.\n",
+                   current->pid);
 
+            dmutex_unlock(&dev->outgoing_lock);
             if (wait_event_interruptible(
                     dev->ctl_outgoing_wait,
-                    ! list_empty(& dev->ctl_outgoing_head)))
+                    ! list_empty(& dev->ctl_outgoing_head)) ||
+                dmutex_lock_interruptible(&dev->outgoing_lock))
             {
                 /* Interrupted; give up here. */
                 return -ERESTARTSYS;
             }
-
-            spin_lock(&dev->lock);
         }
 
         /* Get the outgoing message structure first on the list. */
@@ -355,6 +424,8 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
     }
 
     out = dev->ctl_current_outgoing;
+    printk(KERN_DEBUG "[%d] ubdctl_read: current_outgoing is at %p\n",
+           current->pid, out);
 
     /* Write as much as we can to userspace. */
     n_pending = out->request->ubd_header.ubd_size - out->n_written;
@@ -362,12 +433,16 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
     if (n_to_write > n_pending) {
         n_to_write = n_pending;
     }
+    printk(KERN_DEBUG "[%d] ubdctl_read: will write %zu bytes.\n", current->pid,
+           n_to_write);
 
     if (copy_to_user(buffer, ((char *) out->request) + out->n_written,
                      n_to_write) != 0)
     {
         /* Failed -- userspace address isn't valid. */
-        spin_unlock(&dev->lock);
+        printk(KERN_ERR "[%d] ubdctl_read: invalid userspace buffer.\n",
+               current->pid);
+        dmutex_unlock(&dev->outgoing_lock);
         return -EFAULT;
     }
 
@@ -380,12 +455,13 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
         kfree(out->request);
         kfree(out);
         dev->ctl_current_outgoing = NULL;
+        printk(KERN_DEBUG "[%d] ubdctl_read: message completed; "
+               "current_outgoing now NULL.\n", current->pid);
     }
-
-    spin_unlock(&dev->lock);
 
     /* Update the file pointer (just to keep tell() happy). */
     *offp += n_to_write;
+    dmutex_unlock(&dev->outgoing_lock);    
 
     return n_to_write;
 }
@@ -400,11 +476,23 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 
     BUG_ON(dev == NULL);
 
-    spin_lock(&dev->lock);
+    printk(KERN_DEBUG "[%d] ubdctl_write: Receiving %zu bytes; currently have "
+           "%u bytes in message.\n", current->pid, size,
+           dev->ctl_incoming.n_read);
+
+    if (dmutex_lock_interruptible(&dev->incoming_lock)) {
+        return -ERESTARTSYS;
+    }
+    
     in = &dev->ctl_incoming;
+
+    printk(KERN_DEBUG "[%d] ubdctl_write: reply buffer is at %p and has %u "
+           "bytes of capacity.\n", current->pid, in->reply, in->capacity);
 
     /* Have we read the header yet? */
     if (in->n_read < sizeof(struct ubd_header)) {
+        void *rptr;
+        
         /* Read just enough to handle the header. */
         n_to_read = sizeof(struct ubd_header) - in->n_read;
 
@@ -412,16 +500,22 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
             n_to_read = size;
         }
 
+        rptr = ((char *) in->reply) + in->n_read;
+        
+        printk(KERN_DEBUG "[%d] ubdctl_write: reading %zd header bytes into %p.\n",
+               current->pid, n_to_read, rptr);
+
         /* Do the move from userspace into kernelspace. */
-        if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
-                           n_to_read) != 0)
-        {
+        if (copy_from_user(rptr, buffer, n_to_read) != 0) {
             /* Failed -- userspace address isn't valid. */
-            spin_unlock(&dev->lock);
+            dmutex_unlock(&dev->incoming_lock);
+            printk(KERN_INFO "[%d] ubdctl_write: invalid userspace address.\n",
+                   current->pid);
             return -EFAULT;
         }
 
-        /* Adjust pointers to accomodate the part of the header we just read. */
+        /* Adjust pointers to accomodate the part of the header we just
+           read. */
         in->n_read += n_to_read;
         n_read += n_to_read;
         *offp += n_to_read;
@@ -431,23 +525,36 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
         /* Is the header complete now? */
         if (in->n_read < sizeof(struct ubd_header)) {
             /* Nope; stop here. */
-            spin_unlock(&dev->lock);
+            dmutex_unlock(&dev->incoming_lock);
+            printk(KERN_DEBUG "[%d] ubdctl_write: Header not done.\n",
+                   current->pid);
             return n_read;
         }
+
+        printk(KERN_DEBUG "[%d] ubdctl_write: packet size is %u bytes.\n",
+               current->pid, in->reply->ubd_header.ubd_size);
 
         /* Yes; is the size sensical?  If so, do we have enough capacity? */
         if (in->reply->ubd_header.ubd_size <= UBD_MAX_MESSAGE_SIZE) {
             if (in->capacity < in->reply->ubd_header.ubd_size) {
                 /* Need more capacity. */
-                struct ubd_reply *newbuf = kmalloc(
-                    in->reply->ubd_header.ubd_size, GFP_NOIO);
+                struct ubd_reply *newbuf;
+
+                printk(KERN_DEBUG "[%d] ubdctl_write: current buffer is too "
+                       "small; resizing from %u to %u bytes.\n",
+                       current->pid, in->capacity,
+                       in->reply->ubd_header.ubd_size);
+                newbuf = kmalloc(in->reply->ubd_header.ubd_size, GFP_NOIO);
 
                 if (newbuf == NULL) {
                     /* Allocation failed -- we need to "unread" what we just
                        read. */
-                    spin_unlock(&dev->lock);
+                    printk(KERN_ERR "[%d] ubdctl_write: failed to allocate "
+                           "%u bytes.\n", current->pid,
+                           in->reply->ubd_header.ubd_size);
                     in->n_read -= n_to_read;
                     *offp -= n_to_read;
+                    dmutex_unlock(&dev->incoming_lock);
                     return -ENOMEM;
                 }
 
@@ -460,7 +567,12 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     }
 
     n_to_read = in->reply->ubd_header.ubd_size - in->n_read;
-    if (n_to_read >= size) {
+    printk(KERN_DEBUG "[%d] ubdctl_write: %zd bytes to read to complete "
+           "packet.\n", current->pid, n_to_read);
+    
+    if (n_to_read > size) {
+        printk(KERN_DEBUG "[%d] ubdctl_write: only %zu bytes available; "
+               "limiting read.\n", current->pid, size);
         n_to_read = size;
     }
 
@@ -468,25 +580,41 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
     if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
                        n_to_read) != 0)
     {
+        printk(KERN_ERR "[%d] ubdctl_write: userspace invalid during "
+               "packet body read.\n", current->pid);
+        
         /* Failed -- userspace range isn't fully valid. */
-        spin_unlock(&dev->lock);
-
         if (n_read > 0) {
             /* Can't return EFAULT here -- we're already read part of the
                buffer to get at the header. */
+            printk(KERN_INFO "[%d] ubdctl_write: partial write of "
+                   "%zd bytes completed.\n", current->pid, n_read);
+            dmutex_unlock(&dev->incoming_lock);
             return n_read;
         } else {
+            printk(KERN_INFO "[%d] ubdctl_write: no bytes read; returning "
+                   "EFAULT.\n", current->pid);
+            dmutex_unlock(&dev->incoming_lock);
             return -EFAULT;
         }
     }
 
+    in->n_read += n_to_read;
+
     /* Have we read the entire message? */
     if (in->n_read == in->reply->ubd_header.ubd_size) {
         /* Yep; parse it. */
+        printk(KERN_DEBUG "[%d] ubdctl_write: packet complete; processing.\n",
+               current->pid);
         ubdctl_handle_reply(dev, in->reply);
+    } else {
+        printk(KERN_DEBUG "[%d] ubdctl_write: packet incomplete: need %u "
+               "bytes; have %u bytes.\n", current->pid,
+               in->reply->ubd_header.ubd_size, in->n_read);
     }
 
-    spin_unlock(&dev->lock);
+    dmutex_unlock(&dev->incoming_lock);    
+    printk(KERN_DEBUG "[%d] ubdctl_write: done\n", current->pid);
     return n_read;
 }
 
@@ -502,13 +630,13 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
         /* Indicate when data is available. */
         poll_wait(filp, &dev->ctl_outgoing_wait, wait);
 
-        spin_lock(&dev->lock);
+        dmutex_lock(&dev->outgoing_lock);
         if (dev->ctl_current_outgoing != NULL ||
             ! list_empty(&dev->ctl_outgoing_head))
         {
             result |= (POLLIN | POLLRDNORM);
         }
-        spin_unlock(&dev->lock);
+        dmutex_unlock(&dev->outgoing_lock);
     }
 
     /* XXX: Reevaluate should we create a queue for outgoing replies. */
@@ -595,11 +723,11 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT\n",
                current->pid);
 
-        spin_lock(&ubd_devices_lock);
+        dmutex_lock(&ubd_devices_lock);
         list_for_each(iter, &ubd_devices) {
             ++count;
         }
-        spin_unlock(&ubd_devices_lock);
+        dmutex_unlock(&ubd_devices_lock);
 
         printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT -- found %zu "
                "devices\n", current->pid, count);
@@ -621,7 +749,7 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
             return -EFAULT;
         }
 
-        spin_lock(&ubd_devices_lock);
+        dmutex_lock(&ubd_devices_lock);
         list_for_each(iter, &ubd_devices) {
             struct ublkdev *dev;
 
@@ -632,12 +760,10 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 
             /* Found it; return this. */
             dev = container_of(iter, struct ublkdev, list);
-            spin_unlock(&ubd_devices_lock);
-            spin_lock(&dev->lock);
+            dmutex_unlock(&ubd_devices_lock);
 
             if (dev->disk == NULL) {
                 /* Already deallocated? */
-                spin_unlock(&dev->lock);
                 return -EAGAIN;
             }
 
@@ -648,8 +774,6 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
             desc.ubd_info.ubd_major = dev->disk->major;
             desc.ubd_info.ubd_minor = dev->disk->first_minor;
 
-            spin_unlock(&dev->lock);
-
             if (copy_to_user((void *) data, &desc, sizeof(desc)) != 0) {
                 printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace "
                        "address\n", current->pid);
@@ -658,7 +782,7 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 
             return 0;
         }
-        spin_unlock(&ubd_devices_lock);
+        dmutex_lock(&ubd_devices_lock);
         return -EINVAL;
     }
 
@@ -674,9 +798,27 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     struct bio_vec bvec;
     struct req_iterator iter;
     struct request *rq;
+    int32_t status;
+    uint32_t msgtype;
+    uint32_t size;
     uint32_t tag;
-    uint32_t msgtype = reply->ubd_header.ubd_msgtype;
-    uint32_t size = size;
+    int result = -EINVAL;
+    unsigned int n_bytes = 0;
+    bool is_unfinished;
+
+    BUG_ON(dev == NULL);
+    BUG_ON(reply == NULL);
+
+    printk(KERN_DEBUG "[%d] ubdctl_handle_reply(dev=%p, reply=%p)\n",
+           current->pid, dev, reply);
+
+    status = reply->ubd_status;
+    msgtype = reply->ubd_header.ubd_msgtype;
+    size = reply->ubd_header.ubd_size;
+    tag = reply->ubd_header.ubd_tag;
+
+    printk(KERN_DEBUG "[%d] ubdctl_handle_reply: msgtype=0x%x, size=%u, "
+           "tag=%u, status=%d\n", current->pid, msgtype, size, tag, status);
 
     /* Make sure the message type and size are sensical. */
     if (msgtype == UBD_MSGTYPE_READ_REPLY) {
@@ -714,18 +856,15 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
         return;
     }
 
-    tag = reply->ubd_header.ubd_tag;
-    
-    spin_lock(&dev->lock);
-
     /* Find the request this belongs to. */
     rq = blk_queue_find_tag(dev->blk_pending, tag);
     if (rq == NULL) {
-        spin_unlock(&dev->lock);
         printk(KERN_INFO "[%d] ubdctl_handle_reply: received reply for "
                "unknown tag %u\n", current->pid, tag);
         return;
     }
+
+    printk(KERN_DEBUG "[%d] ubdctl_handle_reply: rq=%p\n", current->pid, rq);
 
     rq_for_each_segment(bvec, rq, iter) {
         struct bio *bio = iter.bio;
@@ -735,13 +874,16 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
 
         if (reply->ubd_status < 0) {
             /* Error received */
-            blk_end_request_err(rq, reply->ubd_status);
+            printk(KERN_DEBUG "[%d] ubdctl_handle_reply: sending error back to "
+                   "block device.\n", current->pid);
+            result = reply->ubd_status;
         } else if (reply->ubd_status != n_sectors) {
             /* Sector count mismatch. */
             printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u sectors; "
                    "received %u sectors.\n", current->pid, n_sectors,
                    reply->ubd_status);
-            blk_end_request_err(rq, -EIO);
+
+            result = -EIO;
         } else if (bio_data_dir(bio) == READ) {
             /* Read request */
             uint32_t recv_data = reply->ubd_header.ubd_size -
@@ -751,39 +893,53 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                 /* Reply type doesn't match what was requested. */
                 printk(KERN_INFO "[%d] ubdctl_handle_reply: expected read "
                        "reply packet for tag %u.\n", current->pid, tag);
-                blk_end_request_err(rq, -EIO);
+                result = -EIO;
             } else if (recv_data != 512 * n_sectors) {
                 /* Reply size does not match the requested size. */
                 printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u "
                        "bytes; received %u bytes.\n", current->pid,
                        512 * n_sectors, recv_data);
-                blk_end_request_err(rq, -EIO);
+                result = -EIO;
             } else {
                 /* Ok -- copy the data back. */
-                memcpy(bio_data(bio), reply->ubd_data, recv_data);
-                blk_end_request(rq, 0, recv_data);
+                char *buffer;
+                buffer = page_address(bvec.bv_page) + bvec.bv_offset;
+                printk(KERN_DEBUG "[%d] ubdctl_handle_reply: sending data back "
+                       "to bio at %p, bv_len=%u, recv_data=%u\n", current->pid, buffer, bvec.bv_len, recv_data);
+                memcpy(buffer, reply->ubd_data, recv_data);
+
+                printk(KERN_DEBUG "[%d] ubdctl_handle_reply: ending request\n",
+                       current->pid);
+                result = 0;
+                n_bytes = recv_data;
             }
         } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
             if (msgtype != UBD_MSGTYPE_DISCARD_REPLY) {
                 printk(KERN_INFO "[%d] ubdctl_handle_reply: expected discard "
                        "reply packet for tag %u.\n", current->pid, tag);
-                blk_end_request_err(rq, -EIO);
+                result = -EIO;
             } else {
-                blk_end_request(rq, 0, 0);
+                result = 0;
+                n_bytes = 512 * n_sectors;
             }
         } else {
             if (msgtype != UBD_MSGTYPE_WRITE_REPLY) {
                 printk(KERN_INFO "[%d] ubdctl_handle_reply: expected write "
                        "reply packet for tag %u.\n", current->pid, tag);
-                blk_end_request_err(rq, -EIO);
+                result = -EIO;
             } else {
-                blk_end_request(rq, 0, 0);
+                result = 0;
+                n_bytes = 512 * n_sectors;
             }
         }
     }
 
-    blk_queue_end_tag(rq->q, rq);
-    spin_unlock(&dev->lock);
+    BUG_ON(result == -EINVAL);
+
+    printk(KERN_INFO "[%d] ubdctl_handle_reply: finishing request\n",
+           current->pid);
+    is_unfinished = blk_end_request(rq, result, n_bytes);
+    BUG_ON(is_unfinished);
     return;
 }
 
@@ -794,15 +950,17 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     int major;
     int result = -EINVAL;
 
-    spin_lock(&dev->lock);
-
+    if (dmutex_lock_interruptible(&dev->status_lock)) {
+        return -ERESTARTSYS;
+    }
+    
     /* Make sure we haven't already registered a disk on this control
        endpoint */
     if (dev->status != 0) {
         printk(KERN_DEBUG "[%d] ubdctl_register: attempted to register "
                "duplicate device\n", current->pid);
-        result = -EBUSY;
-        goto done;
+        dmutex_unlock(&dev->status_lock);
+        return -EBUSY;
     }
 
     BUG_ON(dev->disk != NULL);
@@ -819,8 +977,8 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
         /* Error -- maybe in the name? */
         printk(KERN_INFO "[%d] ubdctl_register: failed to register block "
                "device with name \"%s\": %d\n", current->pid, name, major);
-        result = major;
-        goto done;
+        dmutex_unlock(&dev->status_lock);
+        return major;
     }
 
     info->ubd_major = (uint32_t) major;
@@ -839,7 +997,8 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     if ((result = blk_queue_init_tags(dev->blk_pending, 64, NULL)) != 0) {
         printk(KERN_ERR "[%d] ubdctl_register: failed to initialize tags: "
                "err=%d\n", current->pid, -result);
-        goto done;
+        dmutex_unlock(&dev->status_lock);
+        return result;
     }
 
     /* Allocate a disk structure. */
@@ -847,8 +1006,8 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     if ((dev->disk = disk = alloc_disk(1)) == NULL) {
         printk(KERN_ERR "[%d] ubdctl_register: failed to allocate gendisk "
                "structure\n", current->pid);
-        result = -ENOMEM;
-        goto done;
+        dmutex_unlock(&dev->status_lock);
+        return -ENOMEM;
     }
 
     printk(KERN_DEBUG "[%d] ubdctl_register: disk structure allocated\n",
@@ -876,34 +1035,28 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
     /* Mark this device as registering */
     dev->status = UBD_STATUS_REGISTERING;
-    wake_up_interruptible(&dev->status_wait);
     dev->flags = info->ubd_flags;
-    result = 0;
+    dmutex_unlock(&dev->status_lock);
 
-    printk(KERN_DEBUG "[%d] ubdctl_register: adding this struct to the list of "
-           "devices\n", current->pid);
+    printk(KERN_DEBUG "[%d] ubdctl_register: adding this struct to the list "
+           "of devices\n", current->pid);
 
     /* Add this to the list of registered disks. */
-    spin_lock(&ubd_devices_lock);
+    dmutex_lock(&ubd_devices_lock);
     list_add_tail(&dev->list, &ubd_devices);
-    spin_unlock(&ubd_devices_lock);
+    dmutex_unlock(&ubd_devices_lock);
 
     printk(KERN_DEBUG "[%d] ubdctl_register: done", current->pid);
 
-done:
-    spin_unlock(&dev->lock);
-    return result;
+    return 0;
 }
 
 
 static int ubdctl_unregister(struct ublkdev *dev) {
     BUG_ON(dev == NULL);
 
-    spin_lock(&dev->lock);
-    
     if ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
         /* Can't unregister a device coming up. */
-        spin_unlock(&dev->lock);
         printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a device in a transient state.\n", current->pid);
         return -EBUSY;
@@ -911,14 +1064,13 @@ static int ubdctl_unregister(struct ublkdev *dev) {
 
     if ((dev->status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
         /* Device isn't running. */
-        spin_unlock(&dev->lock);
         printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a non-running device.\n", current->pid);
         return -EINVAL;
     }
 
-    dev->status &= ~UBD_STATUS_RUNNING;
-    dev->status |= UBD_STATUS_UNREGISTERING;
+    dev->status =
+        (dev->status | UBD_STATUS_UNREGISTERING) & ~UBD_STATUS_RUNNING;
     wake_up_interruptible(&dev->status_wait);
 
     /* Are we serving traffic? */
@@ -928,32 +1080,35 @@ static int ubdctl_unregister(struct ublkdev *dev) {
         printk(KERN_DEBUG "[%d] ubdctl_unregister: unregistering an "
                "open device\n", current->pid);
         
-        /* Reply to all pending messages. */
-        spin_unlock(&dev->lock);
+        /* Move the tagged commands back so we can read them again. */
         blk_queue_invalidate_tags(dev->blk_pending);
-
-        spin_lock(dev->blk_pending->queue_lock);
-        while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
-            spin_unlock(dev->blk_pending->queue_lock);
-            blk_end_request_err(req, -EIO);
-            spin_lock(dev->blk_pending->queue_lock);
-        }
-        spin_unlock(dev->blk_pending->queue_lock);
-        spin_lock(&dev->lock);
 
         /* Wait for the device to be unmounted. */
         while ((dev->status & UBD_STATUS_OPENED) != 0) {
-            int wait_result;
+            uint32_t n_failed = 0;
 
-            spin_unlock(&dev->lock);
-            wait_result = wait_event_interruptible(
-                dev->status_wait,
-                (dev->status & UBD_STATUS_OPENED) == 0);
-            spin_lock(&dev->lock);
+            printk(KERN_DEBUG "[%d] ubdctl_unregister: device is opened; "
+                   "will fail existing requests.\n", current->pid);
+            
+            spin_lock(dev->blk_pending->queue_lock);
+            /* Reply to all pending messages. */
+            while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
+                blk_finish_request(req, -EIO);
+                ++n_failed;
+            }
+            spin_unlock(dev->blk_pending->queue_lock);
 
-            if (wait_result != 0) {
+            printk(KERN_DEBUG "[%d] ubdctl_unregister: failed %u messages.\n",
+                   current->pid, n_failed);
+
+            if (wait_event_interruptible(
+                    dev->status_wait,
+                    (dev->status & UBD_STATUS_OPENED) == 0))
+            {
                 /* Interrupted; we can pick up again, so leave the device in
                    the unregistering state. */
+                printk(KERN_INFO "[%d] ubdctl_unregister: unregister "
+                       "interrupted.\n", current->pid);
                 return -ERESTARTSYS;
             }
         }
@@ -962,30 +1117,28 @@ static int ubdctl_unregister(struct ublkdev *dev) {
     printk(KERN_DEBUG "[%d] ubdctl_unregister: device closed, stopping "
            "disk.\n", current->pid);
     BUG_ON((dev->status & UBD_STATUS_OPENED) != 0);
-    spin_unlock(&dev->lock);
 
     /* Stop the disk. */
     del_gendisk(dev->disk);
+    dev->disk = NULL;
 
     printk(KERN_DEBUG "[%d] ubdctl_unregister: disk stopped; cleaning "
            "queue\n", current->pid);
     blk_cleanup_queue(dev->blk_pending);
 
     /* Clean up the disk structure */
-    spin_lock(&dev->lock);
     dev->flags = 0;
     dev->status = 0;
     dev->blk_pending = NULL;
     dev->disk = NULL;
-    spin_unlock(&dev->lock);
 
     printk(KERN_DEBUG "[%d] ubdctl_unregister: queue cleaned; "
            "removing device from list of devices\n", current->pid);
 
     /* Remove this disk structure from the list of devices. */
-    spin_lock(&ubd_devices_lock);
+    dmutex_lock(&ubd_devices_lock);
     list_del(&dev->list);
-    spin_unlock(&ubd_devices_lock);
+    dmutex_unlock(&ubd_devices_lock);
 
     return 0;
 }
@@ -1014,17 +1167,27 @@ static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
         return -EACCES;
     }
 
-    spin_lock(&dev->lock);
+    if (dmutex_lock_interruptible(&dev->status_lock)) {
+        return -ERESTARTSYS;
+    }
+    
     if ((dev->status & UBD_STATUS_RUNNING) == 0) {
-        spin_unlock(&dev->lock);
         printk(KERN_ERR "[%d] ubdblk_open: device is not running\n",
                current->pid);
+        dmutex_unlock(&dev->status_lock);
         return -EAGAIN;
+    }
+
+    if ((dev->status & UBD_STATUS_OPENED) != 0) {
+        printk(KERN_ERR "[%d] ubdblk_open: device is already open\n",
+               current->pid);
+        dmutex_unlock(&dev->status_lock);
+        return -EBUSY;
     }
     
     dev->status |= UBD_STATUS_OPENED;
+    dmutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);
-    spin_unlock(&dev->lock);
 
     printk(KERN_ERR "[%d] ubdblk_open: success\n", current->pid);
 
@@ -1042,10 +1205,11 @@ static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
 
     printk(KERN_DEBUG "[%d] ubdblk_release: dev=%p\n", current->pid, dev);
 
-    spin_lock(&dev->lock);
+    dmutex_lock(&dev->status_lock);
+    BUG_ON((dev->status & UBD_STATUS_OPENED) == 0);
     dev->status &= ~UBD_STATUS_OPENED;
+    dmutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);    
-    spin_unlock(&dev->lock);
 
     printk(KERN_DEBUG "[%d] ubdblk_release: success\n", current->pid);
     
@@ -1083,25 +1247,24 @@ static void ubdblk_add_disk(struct work_struct *work) {
     BUG_ON(dev == NULL);
 
     /* Go from registering to running+adding */
-    spin_lock(&dev->lock);
-
     printk(KERN_DEBUG "[%d] ubdblk_add_disk: asserting current state\n",
            current->pid);
+    dmutex_lock(&dev->status_lock);    
     BUG_ON(dev->status != UBD_STATUS_REGISTERING);
     dev->status = (UBD_STATUS_ADDING | UBD_STATUS_RUNNING);
+    dmutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);
 
     /* Add the disk to the system. */
-    spin_unlock(&dev->lock);
     printk(KERN_DEBUG "[%d] ubdblk_add_disk: calling add_disk\n",
            current->pid);
     add_disk(dev->disk);
-    spin_lock(&dev->lock);
 
     /* Go from running+adding to just running */
+    dmutex_lock(&dev->status_lock);
     dev->status &= ~UBD_STATUS_ADDING;
+    dmutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);
-    spin_unlock(&dev->lock);
 
     printk(KERN_DEBUG "[%d] ubdblk_add_disk: done\n", current->pid);
 
@@ -1117,10 +1280,10 @@ static void ubdblk_handle_request(struct request_queue *rq) {
     BUG_ON(dev == NULL);
     printk(KERN_DEBUG "[%d] ubdblk_handle_request: dev=%p\n",
            current->pid, dev);
-    
-    spin_lock(&dev->lock);
+
+    dmutex_lock(&dev->status_lock);
     is_running = ((dev->status & UBD_STATUS_RUNNING) != 0);
-    spin_unlock(&dev->lock);
+    dmutex_unlock(&dev->status_lock);
 
     printk(KERN_DEBUG "[%d] ubdblk_handle_request: is_running=%d\n",
            current->pid, is_running);
@@ -1159,7 +1322,7 @@ static void ubdblk_handle_request(struct request_queue *rq) {
         spin_lock_irq(rq->queue_lock);
     }
 
-    printk(KERN_DEBUG "ubdblk_handle_request: done\n");
+    printk(KERN_DEBUG "[%d] ubdblk_handle_request: done\n", current->pid);
 }
 
 
@@ -1254,15 +1417,16 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         }
 
         /* Queue the request for the control endpoint. */
-        spin_lock(&dev->lock);
         printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: adding message to "
                "queue\n", current->pid);
+        dmutex_lock(&dev->outgoing_lock);
         list_add_tail(&msg->list, &dev->ctl_outgoing_head);
-        spin_unlock(&dev->lock);
         printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: request added\n",
             current->pid);
+        dmutex_unlock(&dev->outgoing_lock);
         wake_up_interruptible(&dev->ctl_outgoing_wait);
     }
+
     return;
 }
 
