@@ -168,7 +168,6 @@ class UserBlockDevice(object):
         """
         Returns the next request on this channel.
         """
-        print("next()")
         return UBDRequest.read_from(self.control)
 
     def reply(self, reply):

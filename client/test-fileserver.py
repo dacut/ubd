@@ -17,7 +17,6 @@ from ublkdev import (
 
 def file_backed_server(ubd, fd, size):
     for request in ubd:
-        print("Got a request: %r" % request)
         start_pos = 512 * request.first_sector
         data_size = 512 * request.n_sectors
         end_pos = start_pos + data_size
@@ -50,8 +49,6 @@ def file_backed_server(ubd, fd, size):
         else:
             # Unknown request
             reply = UBDReply(replytype, reply_size, request.tag, -EIO, "")
-
-        print("Sending reply: %r" % reply)
 
         ubd.reply(reply)
 
