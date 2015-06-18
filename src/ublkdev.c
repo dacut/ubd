@@ -970,13 +970,15 @@ static int ubdctl_unregister(struct ublkdev *dev) {
             printk(KERN_DEBUG "[%d] ubdctl_unregister: device is opened; "
                    "will fail existing requests.\n", current->pid);
             
-            spin_lock(dev->blk_pending->queue_lock);
+            spin_lock_irq(dev->blk_pending->queue_lock);
             /* Reply to all pending messages. */
             while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
-                blk_finish_request(req, -EIO);
+                spin_unlock_irq(dev->blk_pending->queue_lock);
+                blk_end_request_err(req, -EIO);
+                spin_lock_irq(dev->blk_pending->queue_lock);
                 ++n_failed;
             }
-            spin_unlock(dev->blk_pending->queue_lock);
+            spin_unlock_irq(dev->blk_pending->queue_lock);
 
             printk(KERN_DEBUG "[%d] ubdctl_unregister: failed %u messages.\n",
                    current->pid, n_failed);
