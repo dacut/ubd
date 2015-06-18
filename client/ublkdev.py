@@ -1,8 +1,9 @@
 from __future__ import absolute_import, print_function
-import cStringIO
+from cStringIO import StringIO
 import ctypes
 import fcntl
 import os
+import select
 import struct
 
 DISK_NAME_LEN = 32
@@ -68,33 +69,6 @@ class UBDRequest(UBDHeader):
         self.data = data
         return
 
-    @classmethod
-    def read_from(cls, fd):
-        packet = cStringIO.StringIO()
-        while packet.tell() < UBDHeader.size:
-            packet.write(os.read(fd, UBDHeader.size - packet.tell()))
-            
-        msgtype, size, tag = struct.unpack(UBDHeader.format, packet.getvalue())
-        
-        assert size >= UBDHeader.size + UBDRequest.size, (
-            "size %d is smaller than %d" %
-            (size, UBDHeader.size + UBDRequest.size))
-        
-        packet.truncate(0)
-        while packet.tell() < UBDRequest.size:
-            packet.write(os.read(fd, UBDRequest.size - packet.tell()))
-
-        n_sectors, first_sector = struct.unpack(
-            UBDRequest.format, packet.getvalue())
-
-        data_size = size - UBDHeader.size - UBDRequest.size
-        packet.truncate(0)
-        while packet.tell() < data_size:
-            packet.write(os.read(fd, data_size - packet.tell()))
-
-        data = packet.getvalue()
-        return cls(msgtype, size, tag, n_sectors, first_sector, data)
-
     def __repr__(self):
         return ("UBDRequest(msgtype=%s, size=%d, tag=%d, n_sectors=%d, "
                 "first_sector=%d, data=%d bytes)" %
@@ -112,21 +86,6 @@ class UBDReply(UBDHeader):
         self.data = data
         return
 
-    def write_to(self, fd):
-        expected_size = UBDHeader.size + UBDReply.size + len(self.data)
-        assert self.size == expected_size, (
-            "size %d is not equal to header(%d) + reply(%d) + data(%d) "
-            "sizes (%d)" % (self.size, UBDHeader.size, UBDReply.size,
-            len(self.data), expected_size))
-
-        payload = (
-            struct.pack(UBDHeader.format, self.msgtype, self.size, self.tag) +
-            struct.pack(UBDReply.format, self.status) +
-            self.data)
-
-        os.write(fd, payload)
-        return
-
     def __repr__(self):
         return ("UBDReply(msgtype=%s, size=%d, tag=%d, status=%d, "
                 "data=%d bytes)" % (
@@ -134,9 +93,15 @@ class UBDReply(UBDHeader):
                     self.size, self.tag, self.status, len(self.data)))
     
 class UserBlockDevice(object):
-    def __init__(self, control_endpoint="/dev/ubdctl"):
+    def __init__(self, control_endpoint="/dev/ubdctl", buffer_size=12):
         super(UserBlockDevice, self).__init__()
-        self.control = os.open(control_endpoint, os.O_RDWR | os.O_SYNC)
+        self.control = os.open(control_endpoint, os.O_RDWR | os.O_SYNC | os.O_NONBLOCK)
+        self.buffer_size = buffer_size
+        self.in_buffer = StringIO("")
+        self.out_buffer = StringIO()
+        self.in_poll = select.poll()
+        self.in_poll.register(self.control, select.POLLIN)
+        self.always_flush = False
         return
 
     def register(self, name, n_sectors, read_only=False):
@@ -163,18 +128,84 @@ class UserBlockDevice(object):
         ubd_describe.ubd_index = index
         fcntl.ioctl(self.control, UBD_IOCDESCRIBE, ubd_describe)
         return ubd_describe.ubd_info
+
+    def _read(self, n_bytes):
+        print("_read wants %d bytes" % n_bytes)
+        result = self.in_buffer.read(n_bytes)
+        if len(result) < n_bytes:
+            # Need more data from the driver
+            if len(self.in_poll.poll(0)) == 0:
+                # No data immediately available; flush the write side.
+                self._flush()
+            print("os.read: %d" % self.buffer_size)
+            data = os.read(self.control, self.buffer_size)
+            print(" -> %d" % len(data))
+            self.in_buffer = StringIO(data)
+            result += self.in_buffer.read(n_bytes - len(result))
+
+        return result
+
+    def _flush(self):
+        if self.out_buffer.tell() > 0:
+            os.write(self.control, self.out_buffer.getvalue())
+            self.out_buffer.truncate(0)
+        return
+
+    def _write(self, data):
+        self.out_buffer.write(data)
+        if self.out_buffer.tell() >= self.buffer_size:
+            self._flush()
+        return
     
-    def next(self):
+    def get_request(self):
         """
         Returns the next request on this channel.
         """
-        return UBDRequest.read_from(self.control)
+        packet = StringIO()
+        while packet.tell() < UBDHeader.size:
+            packet.write(self._read(UBDHeader.size - packet.tell()))
+            print("1: packet size is now %d", packet.tell())
+            
+        msgtype, size, tag = struct.unpack(UBDHeader.format, packet.getvalue())
+        
+        assert size >= UBDHeader.size + UBDRequest.size, (
+            "size %d is smaller than %d" %
+            (size, UBDHeader.size + UBDRequest.size))
+        
+        packet.truncate(0)
+        while packet.tell() < UBDRequest.size:
+            packet.write(self._read(UBDRequest.size - packet.tell()))
 
-    def reply(self, reply):
-        """
-        Sends the given reply to the channel.
-        """
-        reply.write_to(self.control)
+        n_sectors, first_sector = struct.unpack(
+            UBDRequest.format, packet.getvalue())
+
+        data_size = size - UBDHeader.size - UBDRequest.size
+        packet.truncate(0)
+        while packet.tell() < data_size:
+            print("Reading %d bytes for data" % (data_size - packet.tell()))
+            packet.write(self._read(data_size - packet.tell()))
+
+        data = packet.getvalue()
+        return UBDRequest(msgtype, size, tag, n_sectors, first_sector, data)
+
+    def send_reply(self, reply):
+        expected_size = UBDHeader.size + UBDReply.size + len(reply.data)
+        assert reply.size == expected_size, (
+            "size %d is not equal to header(%d) + reply(%d) + data(%d) "
+            "sizes (%d)" % (reply.size, UBDHeader.size, UBDReply.size,
+            len(self.data), expected_size))
+
+        self._write(struct.pack(UBDHeader.format, reply.msgtype, reply.size,
+                                reply.tag))
+        self._write(struct.pack(UBDReply.format, reply.status))
+        if len(reply.data) > 0:
+            self._write(reply.data)
+        return
+
+        
+
+    def next(self):
+        return self.get_request()
 
     def __iter__(self):
         return self

@@ -37,6 +37,17 @@ static int __init ubd_init(void);
 /** Clean up the driver. */
 static void __exit ubd_exit(void);
 
+/** Helper for retrieving the status. */
+static inline uint32_t ubd_get_status(struct ublkdev *dev) {
+    uint32_t status;
+    
+    mutex_lock(&dev->status_lock);
+    status = dev->status;
+    mutex_unlock(&dev->status_lock);
+
+    return status;
+}
+
 /* ***** Control endpoint functions ***** */
 
 /** Handler for open() on the control endpoint. */
@@ -249,12 +260,18 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
             return -ERESTARTSYS;
         }
         
-        while ((dev->status & UBD_STATUS_TRANSIENT) != 0) {
-            printk(KERN_DEBUG "[%d] ubdctl_release: device in transient "
+        while ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING))
+               != 0)
+        {
+            printk(KERN_DEBUG "[%d] ubdctl_release: device is still coming up: "
                    "state: 0x%x\n", current->pid, dev->status);
 
             mutex_unlock(&dev->status_lock);
-            if (wait_event_interruptible(dev->status_wait, dev->status == 0)) {
+            if (wait_event_interruptible(
+                    dev->status_wait,
+                    (ubd_get_status(dev) &
+                     (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) == 0))
+            {
                 printk(KERN_DEBUG "[%d] ubdctl_release: interrupted\n",
                        current->pid);
                 /* Interrupted while waiting. */
@@ -320,17 +337,28 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
         return -ERESTARTSYS;
     }
 
+    printk(KERN_DEBUG "ubdctl_read: size=%zu\n", size);
+
     while (size > 0) {
         struct ubd_outgoing_message *out;
         size_t n_pending;
         size_t n_to_write;
-        
-        while (dev->ctl_current_outgoing == NULL) {
+
+        printk(KERN_DEBUG "ubdctl_read: size now %zu\n", size);
+        if (dev->ctl_current_outgoing == NULL) {
             struct list_head *first_message;
 
-            /* Need to pull a new message off the queue. */
+            printk(KERN_DEBUG "ubdctl_read: getting a new message\n");
+
+            /* We need to pull a new message off the queue. */
             while (list_empty(& dev->ctl_outgoing_head)) {
-                /* No messages; sleep until we have a new one. */
+                /* No messages; have we sent one already? */
+                if (total_written > 0) {
+                    /* Yes; don't wait for a new one. */
+                    break;
+                }
+                
+                /* Haven't sent anything; sleep until we have a new one. */
                 mutex_unlock(&dev->outgoing_lock);
                 if (wait_event_interruptible(
                         dev->ctl_outgoing_wait,
@@ -342,6 +370,13 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
                 }
             }
 
+            if (list_empty(& dev->ctl_outgoing_head)) {
+                /* No messages available; we should have already written one
+                   out to userspace. */
+                BUG_ON(total_written == 0);
+                break;
+            }
+            
             /* Get the outgoing message structure first on the list. */
             first_message = dev->ctl_outgoing_head.next;
             dev->ctl_current_outgoing = list_entry(
@@ -349,6 +384,8 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
 
             /* And remove it from the queue. */
             list_del(first_message);
+
+            printk(KERN_DEBUG "ubdctl_read: message found\n");
         }
 
         out = dev->ctl_current_outgoing;
@@ -360,6 +397,8 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
             n_to_write = n_pending;
         }
 
+        printk(KERN_DEBUG "buffer=%p, size=%zu, n_to_write=%zu\n", buffer,
+               size, n_to_write);
         if (copy_to_user(buffer, ((char *) out->request) + out->n_written,
                          n_to_write) != 0)
         {
@@ -400,61 +439,90 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
                             loff_t *offp)
 {
     struct ublkdev *dev = filp->private_data;
-    struct ubd_incoming_message *in;
-    ssize_t n_read = 0;
-    ssize_t n_to_read = 0;
+    ssize_t total_read = 0;
 
     BUG_ON(dev == NULL);
 
     if (mutex_lock_interruptible(&dev->incoming_lock)) {
         return -ERESTARTSYS;
     }
-    
-    in = &dev->ctl_incoming;
 
-    /* Have we read the header yet? */
-    if (in->n_read < sizeof(struct ubd_header)) {
-        void *rptr;
+    while (size > 0) {
+        size_t n_to_read;
+        struct ubd_incoming_message *in;
         
-        /* Read just enough to handle the header. */
-        n_to_read = sizeof(struct ubd_header) - in->n_read;
+        in = &dev->ctl_incoming;
 
-        if (n_to_read > size) {
-            n_to_read = size;
-        }
-
-        rptr = ((char *) in->reply) + in->n_read;
+        printk(KERN_DEBUG "[%d] ubdctl_write phase1: buffer=%p size=%zu "
+               "n_read=%u\n", current->pid, buffer, size, in->n_read);
         
-        /* Do the move from userspace into kernelspace. */
-        if (copy_from_user(rptr, buffer, n_to_read) != 0) {
-            /* Failed -- userspace address isn't valid. */
-            mutex_unlock(&dev->incoming_lock);
-            printk(KERN_INFO "[%d] ubdctl_write: invalid userspace address.\n",
-                   current->pid);
-            return -EFAULT;
-        }
-
-        /* Adjust pointers to accomodate the part of the header we just
-           read. */
-        in->n_read += n_to_read;
-        n_read += n_to_read;
-        *offp += n_to_read;
-        buffer += n_to_read;
-        size -= n_to_read;
-
-        /* Is the header complete now? */
+        /* Have we read the header yet? */
         if (in->n_read < sizeof(struct ubd_header)) {
-            /* Nope; stop here. */
-            mutex_unlock(&dev->incoming_lock);
-            return n_read;
-        }
+            /* Copy just enough to handle the header. */
+            n_to_read = sizeof(struct ubd_header) - in->n_read;
 
-        /* Yes; is the size sensical?  If so, do we have enough capacity? */
-        if (in->reply->ubd_header.ubd_size <= UBD_MAX_MESSAGE_SIZE) {
+            if (n_to_read > size) {
+                n_to_read = size;
+            }
+
+            printk(KERN_DEBUG "copy_from_user(%p, %p, %zd)\n",
+                   ((char *) in->reply) + in->n_read, buffer, n_to_read);
+        
+            /* Do the move from userspace into kernelspace. */
+            if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
+                               n_to_read) != 0)
+            {
+                /* Failed -- userspace address isn't valid. */
+                mutex_unlock(&dev->incoming_lock);
+                printk(KERN_INFO "[%d] ubdctl_write: invalid userspace "
+                       "address %p.\n", current->pid, buffer);
+                return -EFAULT;
+            }
+
+            /* Adjust pointers to accomodate the part of the header we just
+               read. */
+            in->n_read += n_to_read;
+            total_read += n_to_read;
+            *offp += n_to_read;
+            buffer += n_to_read;
+            size -= n_to_read;
+
+            /* Is the header complete now? */
+            if (in->n_read < sizeof(struct ubd_header)) {
+                /* Nope; stop here. */
+                printk(KERN_DEBUG "ubdctl_write: header not done; exiting "
+                       "now.\n");
+                mutex_unlock(&dev->incoming_lock);
+                return total_read;
+            }
+
+            /* Yes; is the size sensical? */
+            if (in->reply->ubd_header.ubd_size < sizeof(struct ubd_reply)) {
+                printk(KERN_ERR "ubdctl_write: invalid size: reply claims to be "
+                       "%u bytes which is smaller than struct ubd_reply size "
+                       "of %zu bytes\n", in->reply->ubd_header.ubd_size,
+                       sizeof(struct ubd_reply));
+                mutex_unlock(&dev->incoming_lock);
+                return -EIO;
+            }
+
+            if (in->reply->ubd_header.ubd_size > UBD_MAX_MESSAGE_SIZE) {
+                printk(KERN_ERR "ubdctl_write: invalid size: reply is %u bytes "
+                       "which is greater than maximum message size %lu bytes.\n",
+                       in->reply->ubd_header.ubd_size, UBD_MAX_MESSAGE_SIZE);
+                mutex_unlock(&dev->incoming_lock);
+                return -EIO;
+            }
+
+            /* Do we have enough capacity? */
             if (in->capacity < in->reply->ubd_header.ubd_size) {
                 /* Need more capacity. */
                 struct ubd_reply *newbuf;
 
+                printk(KERN_DEBUG "ubdctl_write: message size is %u which is "
+                       "greater than current capacity %u; resizing.\n",
+                       in->reply->ubd_header.ubd_size, in->capacity);
+                
                 newbuf = kmalloc(in->reply->ubd_header.ubd_size, GFP_NOIO);
 
                 if (newbuf == NULL) {
@@ -473,71 +541,74 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
                 memcpy(newbuf, in->reply, in->n_read);
                 kfree(in->reply);
                 in->reply = newbuf;
+                in->capacity = in->reply->ubd_header.ubd_size;
             }
         }
-    }
 
-    n_to_read = in->reply->ubd_header.ubd_size - in->n_read;
+        n_to_read = in->reply->ubd_header.ubd_size - in->n_read;
     
-    if (n_to_read > size) {
-        n_to_read = size;
-    }
+        if (n_to_read > size) {
+            n_to_read = size;
+        }
 
-    /* Do the copy from userspace. */
-    if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
-                       n_to_read) != 0)
-    {
-        printk(KERN_ERR "[%d] ubdctl_write: userspace invalid during "
-               "packet body read.\n", current->pid);
+        /* Do the copy from userspace. */
+        printk(KERN_DEBUG "[%d] ubdctl_write phase2: buffer=%p size=%zu in->size=%u n_read=%u\n",
+               current->pid, buffer, size, in->reply->ubd_header.ubd_size, in->n_read);
         
-        /* Failed -- userspace range isn't fully valid. */
-        if (n_read > 0) {
-            /* Can't return EFAULT here -- we're already read part of the
-               buffer to get at the header. */
-            mutex_unlock(&dev->incoming_lock);
-            return n_read;
-        } else {
+        printk(KERN_DEBUG "copy_from_user(%p, %p, %zd)\n",
+               ((char *) in->reply) + in->n_read, buffer, n_to_read);
+        if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
+                           n_to_read) != 0)
+        {
+            printk(KERN_ERR "[%d] ubdctl_write: userspace invalid during "
+                   "packet body read.\n", current->pid);
+        
+            /* Failed -- userspace range isn't fully valid. */
             mutex_unlock(&dev->incoming_lock);
             return -EFAULT;
         }
-    }
 
-    in->n_read += n_to_read;
-
-    /* Have we read the entire message? */
-    if (in->n_read == in->reply->ubd_header.ubd_size) {
-        /* Yep; parse it. */
-        ubdctl_handle_reply(dev, in->reply);
-        in->n_read = 0;
+        in->n_read += n_to_read;
+        total_read += n_to_read;
+        *offp += n_to_read;
+        buffer += n_to_read;
+        size -= n_to_read;
+        
+        /* Have we read the entire message? */
+        if (in->n_read == in->reply->ubd_header.ubd_size) {
+            /* Yep; parse it. */
+            ubdctl_handle_reply(dev, in->reply);
+            in->n_read = 0;
+        }
     }
 
     mutex_unlock(&dev->incoming_lock);
-    return n_read;
+    return total_read;
 }
 
 
 static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     struct ublkdev *dev = filp->private_data;
-    unsigned long req_events = poll_requested_events(wait);
     unsigned int result = 0;
 
     BUG_ON(dev == NULL);
 
-    if ((req_events & (POLLIN | POLLRDNORM)) != 0) {
-        /* Indicate when data is available. */
-        poll_wait(filp, &dev->ctl_outgoing_wait, wait);
+    /* Indicate when data is available. */
+    printk(KERN_DEBUG "ubdctl_poll: waiting for read events.\n");
+    poll_wait(filp, &dev->ctl_outgoing_wait, wait);
 
-        mutex_lock(&dev->outgoing_lock);
-        if (dev->ctl_current_outgoing != NULL ||
-            ! list_empty(&dev->ctl_outgoing_head))
-        {
-            result |= (POLLIN | POLLRDNORM);
-        }
-        mutex_unlock(&dev->outgoing_lock);
+    mutex_lock(&dev->outgoing_lock);
+    if (dev->ctl_current_outgoing != NULL ||
+        ! list_empty(&dev->ctl_outgoing_head))
+    {
+        result |= (POLLIN | POLLRDNORM);
     }
+    mutex_unlock(&dev->outgoing_lock);
 
     /* XXX: Reevaluate should we create a queue for outgoing replies. */
     result |= POLLOUT | POLLWRNORM;
+
+    printk(KERN_DEBUG "ubdctl_poll: result=%x\n", result);
 
     return result;
 }
@@ -684,6 +755,8 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
     }
 
     default:
+        printk(KERN_INFO "[%d] ubdctl_ioctl: unknown ioctl 0x%x\n",
+               current->pid, cmd);
         return -EINVAL;
     }
 
@@ -1127,8 +1200,6 @@ static void ubdblk_add_disk(struct work_struct *work) {
     BUG_ON(dev == NULL);
 
     /* Go from registering to running+adding */
-    printk(KERN_DEBUG "[%d] ubdblk_add_disk: asserting current state\n",
-           current->pid);
     mutex_lock(&dev->status_lock);    
     BUG_ON(dev->status != UBD_STATUS_REGISTERING);
     dev->status = (UBD_STATUS_ADDING | UBD_STATUS_RUNNING);
@@ -1139,6 +1210,9 @@ static void ubdblk_add_disk(struct work_struct *work) {
     printk(KERN_DEBUG "[%d] ubdblk_add_disk: calling add_disk\n",
            current->pid);
     add_disk(dev->disk);
+
+    printk(KERN_DEBUG "[%d] ubdblk_add_disk: add_disk returned\n",
+           current->pid);
 
     /* Go from running+adding to just running */
     mutex_lock(&dev->status_lock);
