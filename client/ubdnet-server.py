@@ -3,7 +3,8 @@ from __future__ import absolute_import, print_function
 from errno import EIO
 from getopt import getopt, GetoptError
 from os import (
-    fstat, lseek, O_RDWR, O_SYNC, open as os_open, read, SEEK_SET, write)
+    fstat, lseek, O_RDWR, O_SYNC, open as os_open, read, SEEK_END, SEEK_SET,
+    write)
 from multiprocessing import Process
 from six.moves import cStringIO
 from select import poll, POLLIN, POLLOUT
@@ -24,12 +25,14 @@ class UBDNetServer(object):
                  buffer_size=DEFAULT_BUFFER_SIZE):
         super(UBDNetServer, self).__init__()
         self.fd = os_open(filename, O_RDWR | O_SYNC)
-        self.size = fstat(self.fd).st_size
+        self.size = lseek(self.fd, 0, SEEK_END)
         self.server = socket(AF_INET, SOCK_STREAM)
         self.server.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.server.bind((interface, port))
         self.server.listen(1)
         self.buffer_size = buffer_size
+
+        lseek(self.fd, 0, SEEK_SET)
         return
 
     def close(self):
