@@ -50,7 +50,7 @@ def file_backed_server(ubd, fd, size):
             # Unknown request
             reply = UBDReply(replytype, reply_size, request.tag, -EIO, "")
 
-        ubd.send_reply(reply)
+        reply.write_to(ubd)
 
     print("File server done")
     return
