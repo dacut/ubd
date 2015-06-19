@@ -36,7 +36,7 @@ insmod ublkdev.ko
 The client-side library is still being worked out; only Python is available
 for now.  `test-fileserver.py` gives a good example of a loop driver.
 
-The smallest "hello world" example:
+The smallest "hello world" example -- a block `/dev/null` driver:
 
 ```
 import ublkdev
@@ -53,8 +53,9 @@ for request in ubd:
     else:
         data = ""
 
-    ubd.reply(ublkdev.UBDReply(replytype, replysize, request.tag,
-                               request.n_sectors, data)
+    ubd.send_reply(
+        ublkdev.UBDReply(replytype, replysize, request.tag,
+                         request.n_sectors, data))
 ```
 
 
