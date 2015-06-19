@@ -4,13 +4,12 @@ This module is to block devices what [FUSE](http://fuse.sourceforge.net/) is
 to filesystems: it provides a small translation layer that redirects block
 device requests to a program running in userspace.
 
-Right now, this code is **pre-alpha** quality.  As of this writing
-(June 2015), I just fumbled my way through fixing up a bunch of locking
-issues and got read requests working.  My main reference for developing this
+Right now, this code is **alpha** quality.  My main reference for developing this
 is [*Linux Device Drivers, Third Edition*](https://lwn.net/Kernel/LDD3/) --
 a well written but, unfortunately, equally well-dated reference book; blog
 postings by Jonathan Corbet; reading/skimming through kernel source; and
-trial and error.
+trial and error.  Nobody else has reviewed this code for correctness or
+security issues.
 
 If this doesn't scare you off production use... well, good luck with that.
 
@@ -61,7 +60,16 @@ for request in ubd:
 
 # Benchmarking
 
-Right now, excessive logging prevents any serious performance.  But if you
+Given the number of context switches, validation, and copying going on, this driver will
+never threaten raw hardware.  This is what I see on a 10 MB loop file:
+```
+root@ubddev:~# dd if=/dev/ubd/foo of=/dev/null
+20480+0 records in
+20480+0 records out
+10485760 bytes (10 MB) copied, 0.0591159 s, 177 MB/s
+```
+
+Test builds may have excessive logging that prevents any serious performance.  If you
 want a good laugh, take a look at this output -- this is on a 2013 vintage
 MacBook Pro with an SSD (with VMware running Ubuntu 15.04):
 
@@ -71,10 +79,6 @@ root@ubddev:~# dd if=/dev/ubd/foo of=/dev/null
 20480+0 records out
 10485760 bytes (10 MB) copied, 69.6044 s, 151 kB/s
 ```
-
-Again, this is hampered by tons of logging; however, even when I get around
-to fixing that, don't expect any breathtaking performance here.
-
 
 # License
 
