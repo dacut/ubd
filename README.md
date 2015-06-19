@@ -20,7 +20,7 @@ drive, and Gmail.  (I don't recommend this, but if you do get it to work,
 I'd love to see the results.)
 
 
-# Building and Running
+## Building and Running
 
 Currently tested only on Ubuntu 15.04 Server, but it's straightforward:
 
@@ -31,7 +31,7 @@ insmod ublkdev.ko
 ```
 
 
-# Client Programs
+## Client Programs
 
 The client-side library is still being worked out; only Python is available
 for now.  `test-fileserver.py` gives a good example of a loop driver.
@@ -58,7 +58,7 @@ for request in ubd:
 ```
 
 
-# Benchmarking
+## Benchmarking
 
 Given the number of context switches, validation, and copying going on, this driver will
 never threaten raw hardware.  This is what I see on a 10 MB loop file:
@@ -80,7 +80,7 @@ root@ubddev:~# dd if=/dev/ubd/foo of=/dev/null
 10485760 bytes (10 MB) copied, 69.6044 s, 151 kB/s
 ```
 
-# License
+## License
 
 This code is licensed under the [BSD 2-Clause
 License](http://opensource.org/licenses/BSD-2-Clause).
