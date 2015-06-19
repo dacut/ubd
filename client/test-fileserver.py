@@ -146,7 +146,7 @@ Options:
     return
 
 def parse_size(value):
-    m = match(r"^([1-9][0-9])*\s*([kMG])$", value)
+    m = match(r"^([1-9][0-9]*)\s*([kMG])$", value)
     if m is None:
         raise ValueError("Invalid size: %r" % value)
 

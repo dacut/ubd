@@ -130,16 +130,13 @@ class UserBlockDevice(object):
         return ubd_describe.ubd_info
 
     def _read(self, n_bytes):
-        print("_read wants %d bytes" % n_bytes)
         result = self.in_buffer.read(n_bytes)
         if len(result) < n_bytes:
             # Need more data from the driver
             if len(self.in_poll.poll(0)) == 0:
                 # No data immediately available; flush the write side.
                 self._flush()
-            print("os.read: %d" % self.buffer_size)
             data = os.read(self.control, self.buffer_size)
-            print(" -> %d" % len(data))
             self.in_buffer = StringIO(data)
             result += self.in_buffer.read(n_bytes - len(result))
 
@@ -164,7 +161,6 @@ class UserBlockDevice(object):
         packet = StringIO()
         while packet.tell() < UBDHeader.size:
             packet.write(self._read(UBDHeader.size - packet.tell()))
-            print("1: packet size is now %d", packet.tell())
             
         msgtype, size, tag = struct.unpack(UBDHeader.format, packet.getvalue())
         
@@ -182,7 +178,6 @@ class UserBlockDevice(object):
         data_size = size - UBDHeader.size - UBDRequest.size
         packet.truncate(0)
         while packet.tell() < data_size:
-            print("Reading %d bytes for data" % (data_size - packet.tell()))
             packet.write(self._read(data_size - packet.tell()))
 
         data = packet.getvalue()

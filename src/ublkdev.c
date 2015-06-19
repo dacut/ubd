@@ -337,18 +337,13 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
         return -ERESTARTSYS;
     }
 
-    printk(KERN_DEBUG "ubdctl_read: size=%zu\n", size);
-
     while (size > 0) {
         struct ubd_outgoing_message *out;
         size_t n_pending;
         size_t n_to_write;
 
-        printk(KERN_DEBUG "ubdctl_read: size now %zu\n", size);
         if (dev->ctl_current_outgoing == NULL) {
             struct list_head *first_message;
-
-            printk(KERN_DEBUG "ubdctl_read: getting a new message\n");
 
             /* We need to pull a new message off the queue. */
             while (list_empty(& dev->ctl_outgoing_head)) {
@@ -384,8 +379,6 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
 
             /* And remove it from the queue. */
             list_del(first_message);
-
-            printk(KERN_DEBUG "ubdctl_read: message found\n");
         }
 
         out = dev->ctl_current_outgoing;
@@ -397,8 +390,6 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
             n_to_write = n_pending;
         }
 
-        printk(KERN_DEBUG "buffer=%p, size=%zu, n_to_write=%zu\n", buffer,
-               size, n_to_write);
         if (copy_to_user(buffer, ((char *) out->request) + out->n_written,
                          n_to_write) != 0)
         {
@@ -453,9 +444,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
         
         in = &dev->ctl_incoming;
 
-        printk(KERN_DEBUG "[%d] ubdctl_write phase1: buffer=%p size=%zu "
-               "n_read=%u\n", current->pid, buffer, size, in->n_read);
-        
         /* Have we read the header yet? */
         if (in->n_read < sizeof(struct ubd_header)) {
             /* Copy just enough to handle the header. */
@@ -465,17 +453,12 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
                 n_to_read = size;
             }
 
-            printk(KERN_DEBUG "copy_from_user(%p, %p, %zd)\n",
-                   ((char *) in->reply) + in->n_read, buffer, n_to_read);
-        
             /* Do the move from userspace into kernelspace. */
             if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
                                n_to_read) != 0)
             {
                 /* Failed -- userspace address isn't valid. */
                 mutex_unlock(&dev->incoming_lock);
-                printk(KERN_INFO "[%d] ubdctl_write: invalid userspace "
-                       "address %p.\n", current->pid, buffer);
                 return -EFAULT;
             }
 
@@ -490,8 +473,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
             /* Is the header complete now? */
             if (in->n_read < sizeof(struct ubd_header)) {
                 /* Nope; stop here. */
-                printk(KERN_DEBUG "ubdctl_write: header not done; exiting "
-                       "now.\n");
                 mutex_unlock(&dev->incoming_lock);
                 return total_read;
             }
@@ -519,10 +500,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
                 /* Need more capacity. */
                 struct ubd_reply *newbuf;
 
-                printk(KERN_DEBUG "ubdctl_write: message size is %u which is "
-                       "greater than current capacity %u; resizing.\n",
-                       in->reply->ubd_header.ubd_size, in->capacity);
-                
                 newbuf = kmalloc(in->reply->ubd_header.ubd_size, GFP_NOIO);
 
                 if (newbuf == NULL) {
@@ -552,11 +529,6 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
         }
 
         /* Do the copy from userspace. */
-        printk(KERN_DEBUG "[%d] ubdctl_write phase2: buffer=%p size=%zu in->size=%u n_read=%u\n",
-               current->pid, buffer, size, in->reply->ubd_header.ubd_size, in->n_read);
-        
-        printk(KERN_DEBUG "copy_from_user(%p, %p, %zd)\n",
-               ((char *) in->reply) + in->n_read, buffer, n_to_read);
         if (copy_from_user(((char *) in->reply) + in->n_read, buffer,
                            n_to_read) != 0)
         {
@@ -594,7 +566,6 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     BUG_ON(dev == NULL);
 
     /* Indicate when data is available. */
-    printk(KERN_DEBUG "ubdctl_poll: waiting for read events.\n");
     poll_wait(filp, &dev->ctl_outgoing_wait, wait);
 
     mutex_lock(&dev->outgoing_lock);
@@ -607,8 +578,6 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
 
     /* XXX: Reevaluate should we create a queue for outgoing replies. */
     result |= POLLOUT | POLLWRNORM;
-
-    printk(KERN_DEBUG "ubdctl_poll: result=%x\n", result);
 
     return result;
 }
@@ -1317,8 +1286,6 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         }
 
         /* Allocate a tag for this request */
-        printk(KERN_ERR "[%d] ubdblk_handle_fs_request: rq->q=%p\n",
-               current->pid, rq->q);
         BUG_ON(dev->blk_pending == NULL);
         spin_lock(dev->blk_pending->queue_lock);
         tag_result = blk_queue_start_tag(dev->blk_pending, rq);
