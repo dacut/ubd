@@ -245,6 +245,8 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
     init_waitqueue_head(&dev->status_wait);
     mutex_init(&dev->status_lock);
     dev->flags = 0;
+    atomic_set(&dev->n_pending, 0);
+    init_waitqueue_head(&dev->n_pending_wait);
 
     return 0;
 }
@@ -330,6 +332,7 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
 {
     struct ublkdev *dev = filp->private_data;
     ssize_t total_written = 0;
+    unsigned int n_messages = 0;
 
     BUG_ON(dev == NULL);
 
@@ -408,20 +411,22 @@ static ssize_t ubdctl_read(struct file *filp, char *buffer, size_t size,
             /* Yes -- discard it. */
             kfree(out->request);
             kfree(out);
+            ++n_messages;
             dev->ctl_current_outgoing = NULL;
+            BUG_ON(n_to_write != n_pending);
+        } else {
+            BUG_ON(n_to_write != size);
         }
-
-        /* Update the file pointer (just to keep tell() happy). */
-        *offp += n_to_write;
 
         /* Move the buffer pointer and adjust size so we can keep writing
            packets (minimizes context switches). */
         buffer += n_to_write;
         size -= n_to_write;
         total_written += n_to_write;
+        *offp += n_to_write;                
     }
     
-    mutex_unlock(&dev->outgoing_lock);    
+    mutex_unlock(&dev->outgoing_lock);
 
     return total_written;
 }
@@ -862,6 +867,12 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     BUG_ON(result == -EINVAL);
     is_unfinished = blk_end_request(rq, result, n_bytes);
     BUG_ON(is_unfinished);
+
+    /* ubdblk_handle_fs_request might be waiting for a tag.  Notify it
+       that we just made one available. */
+    atomic_dec(&dev->n_pending);
+    wake_up_interruptible(&dev->n_pending_wait);
+
     return;
 }
 
@@ -879,7 +890,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     /* Make sure we haven't already registered a disk on this control
        endpoint */
     if (dev->status != 0) {
-        printk(KERN_DEBUG "[%d] ubdctl_register: attempted to register "
+        printk(KERN_INFO "[%d] ubdctl_register: attempted to register "
                "duplicate device\n", current->pid);
         mutex_unlock(&dev->status_lock);
         return -EBUSY;
@@ -891,9 +902,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     memcpy(name, info->ubd_name, DISK_NAME_LEN);
     name[DISK_NAME_LEN] = '\0';
 
-    printk(KERN_DEBUG "[%d] ubdctl_register: disk_name is %s\n",
-           current->pid, name);
-
     /* Register the block device. */
     if ((major = register_blkdev(0, name)) < 0) {
         /* Error -- maybe in the name? */
@@ -904,11 +912,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     }
 
     info->ubd_major = (uint32_t) major;
-    printk(KERN_DEBUG "[%d] ubdctl_register: major is %ud\n", current->pid,
-           (unsigned int) major);
-
-    printk(KERN_DEBUG "[%d] ubdctl_register: initalizing request queue\n",
-           current->pid);
 
     /* Register the request handler */
     dev->blk_pending = blk_init_queue(ubdblk_handle_request, NULL);
@@ -916,7 +919,9 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
     /* XXX: We only support one segment at a time for now. */
     blk_queue_max_segments(dev->blk_pending, 1);
-    if ((result = blk_queue_init_tags(dev->blk_pending, 64, NULL)) != 0) {
+    if ((result = blk_queue_init_tags(
+             dev->blk_pending, UBD_MAX_TAGS, NULL)) != 0)
+    {
         printk(KERN_ERR "[%d] ubdctl_register: failed to initialize tags: "
                "err=%d\n", current->pid, -result);
         mutex_unlock(&dev->status_lock);
@@ -932,9 +937,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
         return -ENOMEM;
     }
 
-    printk(KERN_DEBUG "[%d] ubdctl_register: disk structure allocated\n",
-           current->pid);
-
     /* Fill in the disk structure. */
     disk->major = major;
     disk->first_minor = 0;
@@ -948,9 +950,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     set_capacity(disk, info->ubd_nsectors);
     disk->private_data = dev;
 
-    printk(KERN_DEBUG "[%d] ubdctl_register: scheduling worker to invoke "
-           "add_disk()\n", current->pid);
-
     /* Add the disk after this method returns. */
     INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
     schedule_work(&dev->add_disk_work);
@@ -960,15 +959,10 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     dev->flags = info->ubd_flags;
     mutex_unlock(&dev->status_lock);
 
-    printk(KERN_DEBUG "[%d] ubdctl_register: adding this struct to the list "
-           "of devices\n", current->pid);
-
     /* Add this to the list of registered disks. */
     mutex_lock(&ubd_devices_lock);
     list_add_tail(&dev->list, &ubd_devices);
     mutex_unlock(&ubd_devices_lock);
-
-    printk(KERN_DEBUG "[%d] ubdctl_register: done", current->pid);
 
     return 0;
 }
@@ -1125,16 +1119,12 @@ static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
     dev = disk->private_data;
     BUG_ON(dev == NULL);
 
-    printk(KERN_DEBUG "[%d] ubdblk_release: dev=%p\n", current->pid, dev);
-
     mutex_lock(&dev->status_lock);
     BUG_ON((dev->status & UBD_STATUS_OPENED) == 0);
     dev->status &= ~UBD_STATUS_OPENED;
     mutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);    
 
-    printk(KERN_DEBUG "[%d] ubdblk_release: success\n", current->pid);
-    
     return;
 }
 
@@ -1287,19 +1277,33 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
 
         /* Allocate a tag for this request */
         BUG_ON(dev->blk_pending == NULL);
-        spin_lock(dev->blk_pending->queue_lock);
-        tag_result = blk_queue_start_tag(dev->blk_pending, rq);
-        spin_unlock(dev->blk_pending->queue_lock);
+
+        while (true) {
+            spin_lock(dev->blk_pending->queue_lock);
+            tag_result = blk_queue_start_tag(dev->blk_pending, rq);
+            spin_unlock(dev->blk_pending->queue_lock);
         
-        if (tag_result != 0) {
-            /* Out of tags; give up. */
-            printk(KERN_ERR "[%d] ubdblk_handle_fs_request: could not get a "
-                   "tag for a request\n", current->pid);
-            kfree(msg->request);
-            kfree(msg);
-            blk_start_request(rq);
-            blk_end_request_err(rq, -ENOMEM);
-            return;
+            if (tag_result == 0) {
+                break;
+            }
+            
+            /* Out of tags; wait for a new tag. */
+            printk(KERN_INFO "[%d] ubdblk_handle_fs_request: could not get a "
+                   "tag for a request: tag_result=%d n_pending=%d -- will"
+                   "sleep\n",  current->pid, tag_result,
+                   (int) atomic_read(&dev->n_pending));
+
+            if (wait_event_interruptible(
+                    dev->n_pending_wait,
+                    atomic_read(&dev->n_pending) < UBD_MAX_TAGS))
+            {
+                // Interrupted
+                kfree(ureq);
+                kfree(msg);
+                blk_start_request(rq);
+                blk_end_request_err(rq, -ERESTARTSYS);
+                return;
+            }
         }
 
         /* Initialize the request */
@@ -1321,6 +1325,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         /* Queue the request for the control endpoint. */
         mutex_lock(&dev->outgoing_lock);
         list_add_tail(&msg->list, &dev->ctl_outgoing_head);
+        atomic_inc(&dev->n_pending);
         mutex_unlock(&dev->outgoing_lock);
         wake_up_interruptible(&dev->ctl_outgoing_wait);
     }

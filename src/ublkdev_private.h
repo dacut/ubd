@@ -18,6 +18,12 @@
 /** Initial capacity for holding an incoming message. */
 #define UBD_INITIAL_MESSAGE_CAPACITY        ((size_t) (128u << 10)) /* 128 kB */
 
+/** Maximum number of pending messages.
+ *
+ *  FIXME: Make this user-configurable.
+ */
+#define UBD_MAX_TAGS                64
+
 /** Status: Registering; waiting for add_disk() call to start.
  *
  *  Cannot be combined with any other flags.
@@ -126,6 +132,13 @@ struct ublkdev {
 
     /** Flags passed when registering. */
     uint32_t flags;
+
+    /** Number of messages awaiting a reply. */
+    atomic_t n_pending;
+
+    /** Wait queue for notifying ubdblk_handle_fs_request that n_pending
+        has decremented. */
+    wait_queue_head_t n_pending_wait;    
 };
 
 #endif /* UBLKDEV_PRIVATE_H */

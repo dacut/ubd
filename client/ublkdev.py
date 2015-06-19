@@ -77,7 +77,7 @@ class UBDRequest(UBDHeader):
                  len(self.data)))
 
 class UBDReply(UBDHeader):
-    format = "=I"
+    format = "=i"
     size = struct.calcsize(format)
     
     def __init__(self, msgtype, size, tag, status, data):
@@ -93,7 +93,7 @@ class UBDReply(UBDHeader):
                     self.size, self.tag, self.status, len(self.data)))
     
 class UserBlockDevice(object):
-    def __init__(self, control_endpoint="/dev/ubdctl", buffer_size=12):
+    def __init__(self, control_endpoint="/dev/ubdctl", buffer_size=65536):
         super(UserBlockDevice, self).__init__()
         self.control = os.open(control_endpoint, os.O_RDWR | os.O_SYNC | os.O_NONBLOCK)
         self.buffer_size = buffer_size
@@ -131,6 +131,7 @@ class UserBlockDevice(object):
 
     def _read(self, n_bytes):
         result = self.in_buffer.read(n_bytes)
+        
         if len(result) < n_bytes:
             # Need more data from the driver
             if len(self.in_poll.poll(0)) == 0:
