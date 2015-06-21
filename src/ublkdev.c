@@ -1026,6 +1026,23 @@ static int ubdctl_unregister(struct ublkdev *dev) {
             /* Reply to all pending messages. */
             while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
                 spin_unlock_irq(dev->blk_pending->queue_lock);
+                if (req->cmd_type == REQ_TYPE_FS) {
+                    char const *cmd_type;
+
+                    if (bio_data_dir(req->bio) == WRITE) {
+                        cmd_type = req->bio->bi_rw & REQ_DISCARD ?
+                            "discard" : "write";
+                    } else {
+                        cmd_type = "read";
+                    }
+
+                    printk(KERN_DEBUG "[%d] ubdctl_unregister: flushing "
+                           "%s request", current->pid, cmd_type);
+                } else {
+                    printk(KERN_DEBUG "[%d] ubdctl_unregister: flushing "
+                           "request of type 0x%x", current->pid,
+                           req->cmd_type);
+                }
                 blk_end_request_err(req, -EIO);
                 spin_lock_irq(dev->blk_pending->queue_lock);
                 ++n_failed;
