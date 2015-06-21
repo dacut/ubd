@@ -13,6 +13,7 @@
 #include <linux/types.h>
 
 #include "ublkdev_private.h"
+#include "ublkdev_kernel.h"
 
 MODULE_AUTHOR("dacut@kanga.org");
 MODULE_DESCRIPTION("Userspace block devices");
@@ -36,6 +37,18 @@ static int __init ubd_init(void);
 
 /** Clean up the driver. */
 static void __exit ubd_exit(void);
+
+/* The rq_for_each_segment macro changed incompatibly between Linux 3.13 and
+   3.14.  This takes care of the differences. */
+#if KERNEL_VERSION < 0x030e
+typedef struct bio_vec *ubd_bvec_iter_t;
+#define ubd_bvptr(bvec) (bvec)
+#define ubd_first_sector(iter) ((iter).bio->bi_sector)
+#else
+typedef struct bio_vec ubd_bvec_iter_t;
+#define ubd_bvptr(bvec) (&(bvec))
+#define ubd_first_sector(iter) ((iter).iter.bi_sector)
+#endif
 
 /** Helper for retrieving the status. */
 static inline uint32_t ubd_get_status(struct ublkdev *dev) {
@@ -739,7 +752,7 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
 
 
 static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
-    struct bio_vec bvec;
+    ubd_bvec_iter_t bvec;
     struct req_iterator iter;
     struct request *rq;
     int32_t status;
@@ -837,8 +850,11 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
             } else {
                 /* Ok -- copy the data back. */
                 char *buffer;
-                buffer = page_address(bvec.bv_page) + bvec.bv_offset;
+                unsigned long flags;
+
+                buffer = bvec_kmap_irq(ubd_bvptr(bvec), &flags);
                 memcpy(buffer, reply->ubd_data, recv_data);
+                bvec_kunmap_irq(buffer, &flags);
 
                 result = 0;
                 n_bytes = recv_data;
@@ -1230,7 +1246,7 @@ static void ubdblk_handle_request(struct request_queue *rq) {
 
 
 static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
-    struct bio_vec bvec;
+    ubd_bvec_iter_t bvec;
     struct req_iterator iter;
     struct ubd_outgoing_message *msg;
     struct ubd_request *ureq;
@@ -1315,7 +1331,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
                 UBD_MSGTYPE_WRITE_REQUEST));
         ureq->ubd_header.ubd_size = req_size;
         ureq->ubd_header.ubd_tag = rq->tag;
-        ureq->ubd_first_sector = iter.iter.bi_sector;
+        ureq->ubd_first_sector = ubd_first_sector(iter);
         ureq->ubd_nsectors = bio_sectors(bio);
 
         if (data != NULL) {
