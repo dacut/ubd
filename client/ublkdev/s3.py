@@ -8,7 +8,7 @@ from getopt import getopt, GetoptError
 from json import dumps as json_dumps, loads as json_loads
 from os import environ
 from re import match
-from six.moves.StringIO import cStringIO as StringIO
+from six.moves import cStringIO as StringIO
 from struct import pack, unpack
 from sys import argv, exit, stderr, stdin, stdout
 from threading import Condition, Thread
@@ -45,15 +45,18 @@ class UBDS3Handler(Thread):
                     volume.lock.wait(1)
                     continue
             
-            volume.handle_ubd_request(request)
+            volume.handle_ubd_request(self.bucket, request)
         return
 
 class UBDS3Volume(object):
-    def __init__(self, bucket_name, devname, n_threads=1, **kw):
+    def __init__(self, bucket_name, devname, region, n_threads=1, **kw):
         super(UBDS3Volume, self).__init__()
         self.bucket_name = bucket_name
         self.devname = devname
         self.s3 = boto.s3.connect_to_region(region, **kw)
+        if self.s3 is None:
+            raise RuntimeError("Failed to connect to S3 region %r" % region)
+
         self.ubd = None
         self.n_threads = n_threads
 
@@ -138,7 +141,7 @@ class UBDS3Volume(object):
         if suffix:
             config['suffix'] = suffix
 
-        key.set_contents_as_string(json_dumps(config))
+        key.set_contents_from_string(json_dumps(config), policy=self.policy)
         self.block_size = block_size
         self.encryption = encryption
         self.policy = policy
@@ -454,7 +457,7 @@ def main(args=None):
                 threads = int(value)
 
         if bucket_name is None:
-            raise GetoptErrror("--bucket-name is required")
+            raise GetoptError("--bucket-name is required")
 
         if not create:
             if block_size is not None:
@@ -492,13 +495,17 @@ def main(args=None):
         usage()
         return 1
 
-    volume = UBDS3Volume(bucket_name, devname, threads)
+    volume = UBDS3Volume(bucket_name, devname, region=region,
+                         n_threads=threads)
     if create:
-        volume.create(block_size=block_size, encryption=encryption,
-                      policy=policy, size=size, storage_class=storage_class,
-                      suffix=suffix)
+        volume.create_volume(block_size=block_size, encryption=encryption,
+                             policy=policy, size=size,
+                             storage_class=storage_class,
+                             suffix=suffix)
     else:
         volume.read_volume_info()
+
+    volume.register()
 
     volume.run()
     return 0
