@@ -12,7 +12,7 @@ from six.moves.StringIO import cStringIO as StringIO
 from struct import pack, unpack
 from sys import argv, exit, stderr, stdin, stdout
 from threading import Condition, Thread
-from ublkdev import (
+from .ublkdev import (
     UBD_MSGTYPE_READ_REQUEST, UBD_MSGTYPE_WRITE_REQUEST,
     UBD_MSGTYPE_DISCARD_REQUEST, UBD_MSGTYPE_READ_REPLY,
     UBD_MSGTYPE_WRITE_REPLY, UBD_MSGTYPE_DISCARD_REPLY,
