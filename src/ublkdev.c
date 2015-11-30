@@ -50,6 +50,15 @@ typedef struct bio_vec ubd_bvec_iter_t;
 #define ubd_first_sector(iter) ((iter).iter.bi_sector)
 #endif
 
+/* blk_queue_init_tags added an argument with Linux 4.0. */
+#if KERNEL_VERSION >= 0x0400
+#define ubd_blk_queue_init_tags(queue, depth, tags)                     \
+    blk_queue_init_tags((queue), (depth), (tags), BLK_TAG_ALLOC_FIFO)
+#else
+#define ubd_blk_queue_init_tags(queue, depth, tags)     \
+    blk_queue_init_tags((queue), (depth), (tags))
+#endif
+
 /** Helper for retrieving the status. */
 static inline uint32_t ubd_get_status(struct ublkdev *dev) {
     uint32_t status;
@@ -935,7 +944,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
     /* XXX: We only support one segment at a time for now. */
     blk_queue_max_segments(dev->blk_pending, 1);
-    if ((result = blk_queue_init_tags(
+    if ((result = ubd_blk_queue_init_tags(
              dev->blk_pending, UBD_MAX_TAGS, NULL)) != 0)
     {
         printk(KERN_ERR "[%d] ubdctl_register: failed to initialize tags: "
