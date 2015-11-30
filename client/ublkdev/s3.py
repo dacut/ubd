@@ -381,13 +381,16 @@ def parse_size(value, parameter_name, min=0, max=None):
 
     return result
 
-def main(args):
+def main(args=None):
     bucket_name = block_size = encryption = profile = policy = region = None
     size = storage_class = suffix = None
     proxy_user = environ.get("PROXY_USER")
     proxy_password = environ.get("PROXY_PASSWORD")
     create = False
     threads = 4
+
+    if args is None:
+        args = argv[1:]
 
     try:
         proxy_port = int(environ.get("PROXY_PORT", "0"))
@@ -557,5 +560,3 @@ Creating a new block device:
 
     fd.flush()
 
-if __name__ == "__main__":
-    exit(main(argv[1:]))
