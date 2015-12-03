@@ -164,8 +164,9 @@ class UBDS3Volume(object):
 
         try:
             if req_type == UBD_MSGTYPE_READ_REQUEST:
-                reply_data = self.read(bucket, offset, length)
-                reply_size += length
+                #reply_data = self.read(bucket, offset, length)
+                #reply_size += length
+                reply_status = -EIO
             elif req_type == UBD_MSGTYPE_WRITE_REQUEST:
                 self.write(bucket, offset, req.data)
             elif req_type == UBD_MSGTYPE_DISCARD_REQUEST:

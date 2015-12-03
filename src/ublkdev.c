@@ -38,6 +38,12 @@ static int __init ubd_init(void);
 /** Clean up the driver. */
 static void __exit ubd_exit(void);
 
+/** Actual work of tearing down the driver.
+ *  This allows the logic to be shared with ubd_init if initialization fails.
+ *  Linux doesn't like __init functions calling __exit functions.
+ */
+static void ubd_teardown(void);
+
 /* The rq_for_each_segment macro changed incompatibly between Linux 3.13 and
    3.14.  This takes care of the differences. */
 #if KERNEL_VERSION < 0x030e
@@ -64,7 +70,7 @@ static inline uint32_t ubd_get_status(struct ublkdev *dev) {
     uint32_t status;
     
     mutex_lock(&dev->status_lock);
-    status = dev->status;
+    status = READ_ONCE(dev->status);
     mutex_unlock(&dev->status_lock);
 
     return status;
@@ -99,7 +105,9 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *message);
 /** Register a disk with the control endpoint. */
 static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info);
 
-/** Unregister a disk from the control endpoint. */
+/** Unregister a disk from the control endpoint.
+ *  dev->status_lock MUST be held while calling this function.
+ */
 static int ubdctl_unregister(struct ublkdev *dev);
 
 /** Control endpoint file operations. */
@@ -208,13 +216,18 @@ static int __init ubd_init(void) {
     return 0;
 
 error:
-    ubd_exit();
+    ubd_teardown();
 
     return result;
 }
 
 
 static void __exit ubd_exit(void) {
+    ubd_teardown();
+    return;
+}
+
+static void ubd_teardown(void) {
     if (ubd_major != 0) {
         printk(KERN_DEBUG "ubd unregistering block device %d\n", ubd_major);
         unregister_blkdev(ubd_major, "ubd");
@@ -263,7 +276,7 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
     dev->ctl_incoming.capacity = UBD_INITIAL_MESSAGE_CAPACITY;
     mutex_init(&dev->incoming_lock);
     dev->blk_pending = NULL;
-    dev->status = 0;
+    WRITE_ONCE(dev->status, 0);
     init_waitqueue_head(&dev->status_wait);
     mutex_init(&dev->status_lock);
     dev->flags = 0;
@@ -283,12 +296,19 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
         if (mutex_lock_interruptible(&dev->status_lock)) {
             return -ERESTARTSYS;
         }
-        
-        while ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING))
-               != 0)
-        {
+
+        while (1) {
+            uint32_t status;
+
+            smp_rmb();
+            status = READ_ONCE(dev->status);
+
+            if ((status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) == 0) {
+                break;
+            }
+
             printk(KERN_DEBUG "[%d] ubdctl_release: device is still coming up: "
-                   "state: 0x%x\n", current->pid, dev->status);
+                   "state: 0x%x\n", current->pid, status);
 
             mutex_unlock(&dev->status_lock);
             if (wait_event_interruptible(
@@ -301,6 +321,7 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
                 /* Interrupted while waiting. */
                 return -ERESTARTSYS;
             }
+
             if (mutex_lock_interruptible(&dev->status_lock)) {
                 printk(KERN_DEBUG "[%d] ubdctl_release: interrupted\n",
                        current->pid);
@@ -309,7 +330,16 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
         }
 
         /* Are we running? */
-        while ((dev->status & UBD_STATUS_RUNNING) != 0) {
+        while (1) {
+            uint32_t status;
+
+            smp_rmb();
+            status = READ_ONCE(dev->status);
+
+            if ((status & UBD_STATUS_RUNNING) == 0) {
+                break;
+            }
+
             /* Yes; unregister the device */
             if ((result = ubdctl_unregister(dev)) != 0) {
                 if (result == -EBUSY) {
@@ -335,7 +365,7 @@ static int ubdctl_release(struct inode *inode, struct file *filp) {
         }
         
         /* We should now be ok to release the structure. */
-        BUG_ON(dev->status != 0);
+        BUG_ON(READ_ONCE(dev->status) != 0);
         mutex_unlock(&dev->status_lock);
         mutex_destroy(&dev->outgoing_lock);
         mutex_destroy(&dev->incoming_lock);
@@ -668,7 +698,11 @@ static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
         
         printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCUNREGISTER\n",
                current->pid);
+
+        mutex_lock(&dev->status_lock);
         result = ubdctl_unregister(dev);
+        mutex_unlock(&dev->status_lock);
+
         if (result == 0) {
             printk(KERN_DEBUG "[%d] ubdctl_ioctl: unregister succeeded.\n",
                    current->pid);
@@ -907,6 +941,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     struct gendisk *disk;
     int major;
     int result = -EINVAL;
+    uint32_t status;
 
     if (mutex_lock_interruptible(&dev->status_lock)) {
         return -ERESTARTSYS;
@@ -914,7 +949,10 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     
     /* Make sure we haven't already registered a disk on this control
        endpoint */
-    if (dev->status != 0) {
+    smp_rmb();
+    status = READ_ONCE(dev->status);
+
+    if (status != 0) {
         printk(KERN_INFO "[%d] ubdctl_register: attempted to register "
                "duplicate device\n", current->pid);
         mutex_unlock(&dev->status_lock);
@@ -980,7 +1018,7 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     schedule_work(&dev->add_disk_work);
 
     /* Mark this device as registering */
-    dev->status = UBD_STATUS_REGISTERING;
+    WRITE_ONCE(dev->status, UBD_STATUS_REGISTERING);
     dev->flags = info->ubd_flags;
     mutex_unlock(&dev->status_lock);
 
@@ -994,28 +1032,36 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
 
 
 static int ubdctl_unregister(struct ublkdev *dev) {
+    uint32_t status;
+
     BUG_ON(dev == NULL);
 
-    if ((dev->status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
+    // dev->status_lock *MUST* be held.
+    smp_rmb();
+    status = READ_ONCE(dev->status);
+
+    if ((status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
         /* Can't unregister a device coming up. */
         printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a device in a transient state.\n", current->pid);
         return -EBUSY;
     }
 
-    if ((dev->status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
+    if ((status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
         /* Device isn't running. */
         printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
                "unregister a non-running device.\n", current->pid);
         return -EINVAL;
     }
 
-    dev->status =
-        (dev->status | UBD_STATUS_UNREGISTERING) & ~UBD_STATUS_RUNNING;
+    status = (status | UBD_STATUS_UNREGISTERING) & ~UBD_STATUS_RUNNING;
+    WRITE_ONCE(dev->status, status);
+    smp_wmb();
+    
     wake_up_interruptible(&dev->status_wait);
 
     /* Are we serving traffic? */
-    if ((dev->status & UBD_STATUS_OPENED) != 0) {
+    if ((status & UBD_STATUS_OPENED) != 0) {
         struct request *req;
         
         printk(KERN_DEBUG "[%d] ubdctl_unregister: unregistering an "
@@ -1025,12 +1071,22 @@ static int ubdctl_unregister(struct ublkdev *dev) {
         blk_queue_invalidate_tags(dev->blk_pending);
 
         /* Wait for the device to be unmounted. */
-        while ((dev->status & UBD_STATUS_OPENED) != 0) {
+        while (1) {
+            uint32_t status;
             uint32_t n_failed = 0;
+            bool unfinished;
+
+            smp_rmb();
+            status = READ_ONCE(dev->status);
+
+            if ((dev->status & UBD_STATUS_OPENED) == 0) {
+                break;
+            }
 
             printk(KERN_DEBUG "[%d] ubdctl_unregister: device is opened; "
                    "will fail existing requests.\n", current->pid);
-            
+
+            mutex_unlock(&dev->status_lock);
             spin_lock_irq(dev->blk_pending->queue_lock);
             /* Reply to all pending messages. */
             while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
@@ -1052,7 +1108,8 @@ static int ubdctl_unregister(struct ublkdev *dev) {
                            "request of type 0x%x", current->pid,
                            req->cmd_type);
                 }
-                blk_end_request_err(req, -EIO);
+                unfinished = blk_end_request_err(req, -EIO);
+                BUG_ON(unfinished);
                 spin_lock_irq(dev->blk_pending->queue_lock);
                 ++n_failed;
             }
@@ -1063,12 +1120,13 @@ static int ubdctl_unregister(struct ublkdev *dev) {
 
             if (wait_event_interruptible(
                     dev->status_wait,
-                    (dev->status & UBD_STATUS_OPENED) == 0))
+                    (ubd_get_status(dev) & UBD_STATUS_OPENED) == 0))
             {
                 /* Interrupted; we can pick up again, so leave the device in
                    the unregistering state. */
                 printk(KERN_INFO "[%d] ubdctl_unregister: unregister "
                        "interrupted.\n", current->pid);
+                mutex_lock(&dev->status_lock);
                 return -ERESTARTSYS;
             }
         }
@@ -1076,7 +1134,7 @@ static int ubdctl_unregister(struct ublkdev *dev) {
 
     printk(KERN_DEBUG "[%d] ubdctl_unregister: device closed, stopping "
            "disk.\n", current->pid);
-    BUG_ON((dev->status & UBD_STATUS_OPENED) != 0);
+    BUG_ON((READ_ONCE(dev->status) & UBD_STATUS_OPENED) != 0);
 
     /* Stop the disk. */
     del_gendisk(dev->disk);
@@ -1088,7 +1146,7 @@ static int ubdctl_unregister(struct ublkdev *dev) {
 
     /* Clean up the disk structure */
     dev->flags = 0;
-    dev->status = 0;
+    WRITE_ONCE(dev->status, 0);
     dev->blk_pending = NULL;
     dev->disk = NULL;
 
@@ -1155,6 +1213,7 @@ static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
 
 static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
     struct ublkdev *dev;
+    uint32_t status;
 
     BUG_ON(disk == NULL);
 
@@ -1162,8 +1221,13 @@ static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
     BUG_ON(dev == NULL);
 
     mutex_lock(&dev->status_lock);
-    BUG_ON((dev->status & UBD_STATUS_OPENED) == 0);
-    dev->status &= ~UBD_STATUS_OPENED;
+    status = READ_ONCE(dev->status);
+
+    BUG_ON((status & UBD_STATUS_OPENED) == 0);
+    status &= ~UBD_STATUS_OPENED;
+    
+    WRITE_ONCE(dev->status, status);
+
     mutex_unlock(&dev->status_lock);
     wake_up_interruptible(&dev->status_wait);    
 
@@ -1234,21 +1298,28 @@ static void ubdblk_handle_request(struct request_queue *rq) {
 
     BUG_ON(dev == NULL);
 
-    mutex_lock(&dev->status_lock);
-    is_running = ((dev->status & UBD_STATUS_RUNNING) != 0);
-    mutex_unlock(&dev->status_lock);
-
     /* We can't use blk_fetch_request here -- the tag API also starts the
        request, which will result in a bugcheck. */
     while ((req = blk_peek_request(rq)) != NULL) {
+        bool unfinished;
+
         spin_unlock_irq(rq->queue_lock);
+        printk(KERN_INFO "[%d] ublkdev_handle_request: queue spinlock "
+               "released\n", current->pid);
+
+        is_running = ((ubd_get_status(dev) & UBD_STATUS_RUNNING) != 0);
 
         if (unlikely(! is_running)) {
             /* Device is not running; fail the request. */
             printk(KERN_INFO "[%d] ubdblk_handle_request: device is not "
                    "running; failing request\n", current->pid);
             blk_start_request(req);
-            blk_end_request_err(req, -EIO);
+            printk(KERN_INFO "[%d] ublkdev_handle_request: ending request\n",
+                   current->pid);
+            unfinished = blk_end_request_err(req, -EIO);
+            BUG_ON(unfinished);
+            printk(KERN_INFO "[%d] ublkdev_handle_request: request failed.\n",
+                   current->pid);
         } else {
             switch (req->cmd_type) {
             case REQ_TYPE_FS:
@@ -1259,11 +1330,14 @@ static void ubdblk_handle_request(struct request_queue *rq) {
                 printk(KERN_DEBUG "[%d] ubdblk: unknown request type 0x%x\n",
                        current->pid, req->cmd_type);
                 blk_start_request(req);
-                blk_end_request_err(req, -EIO);
+                unfinished = blk_end_request_err(req, -EIO);
+                BUG_ON(unfinished);
                 break;
             }
         }
         
+        printk(KERN_INFO "[%d] ublkdev_handle_request: reacquiring queue "
+               "spinlock\n", current->pid);
         spin_lock_irq(rq->queue_lock);
     }
 
@@ -1285,6 +1359,7 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         size_t req_size = sizeof(*ureq);
         void *data = NULL;
         int tag_result;
+        bool unfinished;
 
         BUG_ON(bio == NULL);
         BUG_ON(bio_segments(bio) != 1);
@@ -1295,7 +1370,8 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
                    "allocate %zu bytes for request.\n", current->pid,
                    sizeof(*msg));
             blk_start_request(rq);
-            blk_end_request_err(rq, -ENOMEM);
+            unfinished = blk_end_request_err(rq, -ENOMEM);
+            BUG_ON(unfinished);
             return;
         }
 
@@ -1313,7 +1389,8 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
                    req_size);
             kfree(msg);
             blk_start_request(rq);
-            blk_end_request_err(rq, -ENOMEM);
+            unfinished = blk_end_request_err(rq, -ENOMEM);
+            BUG_ON(unfinished);
             return;
         }
 
@@ -1343,7 +1420,8 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
                 kfree(ureq);
                 kfree(msg);
                 blk_start_request(rq);
-                blk_end_request_err(rq, -ERESTARTSYS);
+                unfinished = blk_end_request_err(rq, -ERESTARTSYS);
+                BUG_ON(unfinished);
                 return;
             }
         }

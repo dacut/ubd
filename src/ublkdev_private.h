@@ -122,7 +122,7 @@ struct ublkdev {
 
     /** Status of this device.  status_lock must be held to read or write
         this. */
-    volatile uint32_t status;
+    uint32_t status;
 
     /** Spin lock for changing the status. */
     struct mutex status_lock;

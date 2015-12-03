@@ -1,4 +1,5 @@
 ifneq ($(KERNELRELEASE),)
+KBUILD_CFLAGS += -fno-inline
 obj-m := ublkdev.o
 else
 # Get the kernel version and create a preprocessor macro for it.  This allows
