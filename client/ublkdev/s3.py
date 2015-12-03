@@ -6,6 +6,7 @@ import boto.s3
 from errno import EIO
 from getopt import getopt, GetoptError
 from json import dumps as json_dumps, loads as json_loads
+import logging
 from os import environ
 from re import match
 from six.moves import cStringIO as StringIO
@@ -16,7 +17,7 @@ from .ublkdev import (
     UBD_MSGTYPE_READ_REQUEST, UBD_MSGTYPE_WRITE_REQUEST,
     UBD_MSGTYPE_DISCARD_REQUEST, UBD_MSGTYPE_READ_REPLY,
     UBD_MSGTYPE_WRITE_REPLY, UBD_MSGTYPE_DISCARD_REPLY,
-    UBDRequest, UBDReply, UserBlockDevice)
+    UBDHeader, UBDRequest, UBDReply, UserBlockDevice)
 
 suffix_shift = {
     'k': 10,
@@ -26,6 +27,9 @@ suffix_shift = {
     'P': 50,
     'E': 60
 }
+
+log_format = ("%(threadName)s %(asctime)s %(filename)s:%(lineno)d "
+              "[%(levelname)s]: %(message)s")
 
 class UBDS3Handler(Thread):
     def __init__(self, name, volume):
@@ -76,8 +80,13 @@ class UBDS3Volume(object):
         """
         Register ourself with the UBD control endpoint.
         """
+        n_sectors = self.size // 512
+
+        log.info("Registering with UBD control endpoint as %r with %d sectors",
+                 self.devname, n_sectors)
+
         self.ubd = UserBlockDevice()
-        self.ubd.register(self.devname, self.size // 512)
+        self.ubd.register(self.devname, n_sectors)
         return
 
     def run(self):
@@ -86,6 +95,7 @@ class UBDS3Volume(object):
 
         try:
             for thread in self.threads:
+                log.debug("Starting thread %s", thread.name)
                 thread.start()
 
             while not self.stop_requested:
@@ -155,7 +165,7 @@ class UBDS3Volume(object):
         s3handler.handle_ubd_request(bucket, ubd_request)
         """
         req_type = req.msgtype
-        reply_type = 0x80000000 | reqtype
+        reply_type = 0x80000000 | req_type
         reply_data = ""
         offset = 512 * req.first_sector
         length = 512 * req.n_sectors
@@ -166,10 +176,14 @@ class UBDS3Volume(object):
             if req_type == UBD_MSGTYPE_READ_REQUEST:
                 #reply_data = self.read(bucket, offset, length)
                 #reply_size += length
+                log.debug("read offset=%d length=%d", offset, length)
+                log.debug("forcing read to -EIO")
                 reply_status = -EIO
             elif req_type == UBD_MSGTYPE_WRITE_REQUEST:
+                log.debug("write offset=%d length=%d", offset, length)
                 self.write(bucket, offset, req.data)
             elif req_type == UBD_MSGTYPE_DISCARD_REQUEST:
+                log.debug("trim offset=%d length=%d", offset, length)
                 self.trim(bucket, offset, length)
         except OSError as e:
             reply_status = -e.errno
@@ -177,6 +191,7 @@ class UBDS3Volume(object):
         reply = UBDReply(msgtype=reply_type, size=reply_size, tag=req.tag,
                          status=reply_status, data=reply_data)
         reply.write_to(self.ubd)
+        self.ubd.flush()
         return
 
     def read(self, bucket, offset, length):
@@ -386,6 +401,8 @@ def parse_size(value, parameter_name, min=0, max=None):
     return result
 
 def main(args=None):
+    global log
+
     bucket_name = block_size = encryption = profile = policy = region = None
     size = storage_class = suffix = None
     proxy_user = environ.get("PROXY_USER")
@@ -495,6 +512,11 @@ def main(args=None):
         print(str(e), file=stderr)
         usage()
         return 1
+
+    logging.basicConfig(level=logging.DEBUG, stream=stderr,
+                        format=log_format)
+    log = logging.getLogger("ubds3")
+    logging.getLogger("boto").setLevel(logging.INFO)
 
     volume = UBDS3Volume(bucket_name, devname, region=region,
                          n_threads=threads)
