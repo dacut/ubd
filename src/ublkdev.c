@@ -245,11 +245,13 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     struct ublkdev *dev = filp->private_data;
     unsigned int result = 0;
+    unsigned long lock_flags;
 
-    BUG_ON(dev == NULL);
+    if (dev != NULL) {
+        /* Indicate when data is available. */
+        spin_lock_irqsave(&dev->status_wait.lock, lock_flags);
 
-    /* Indicate when data is available. */
-    poll_wait(filp, &dev->ctl_outgoing_wait, wait);
+        poll_wait(filp, &dev->ctl_outgoing_wait, wait);
 
     mutex_lock(&dev->outgoing_lock);
     if (dev->ctl_current_outgoing != NULL ||

@@ -23,6 +23,9 @@
 /** ioctl: describe block device. */
 #define UBD_IOCDESCRIBE     _IOWR(UBD_IOC_MAGIC, 0xa3, struct ubd_describe)
 
+/** ioctl: tie control to block device. */
+#define UBD_IOCTIE          _IOW(UBD_IOC_MAGIC, 0xa4, struct ubd_tie)
+
 /** ioctl: get next request. */
 #define UBD_IOCGETREQUEST   _IOWR(UBD_IOC_MAGIC, 0xa5, struct ubd_message)
 
@@ -51,11 +54,19 @@ struct ubd_info {
 };
 
 struct ubd_describe {
-    /** In: the index to return. */
+    /** [IN] The index to return. */
     size_t ubd_index;
 
-    /** Out: The resulting ubd_info data. */
+    /** [OUT] The resulting ubd_info data. */
     struct ubd_info ubd_info;
+};
+
+struct ubd_tie {
+    /** [IN] The major mode of the device to tie to. */
+    uint32_t mbd_major;
+
+    /** [IN] The name of the device to tie to (if ubd_major is zero). */
+    char ubd_name[DISK_NAME_LEN];
 };
 
 /** ubd_msgtype code for replies. */
