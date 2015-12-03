@@ -174,11 +174,9 @@ class UBDS3Volume(object):
 
         try:
             if req_type == UBD_MSGTYPE_READ_REQUEST:
-                #reply_data = self.read(bucket, offset, length)
-                #reply_size += length
+                reply_data = self.read(bucket, offset, length)
+                reply_size += length
                 log.debug("read offset=%d length=%d", offset, length)
-                log.debug("forcing read to -EIO")
-                reply_status = -EIO
             elif req_type == UBD_MSGTYPE_WRITE_REQUEST:
                 log.debug("write offset=%d length=%d", offset, length)
                 self.write(bucket, offset, req.data)
@@ -308,7 +306,7 @@ class UBDS3Volume(object):
         Return a Boto S3 key object for the given block.  The bucket must be
         a Boto S3 object; this is required for thread safety.
         """
-        key_name = UBDS3Volume.prefix_to_block(block_id) + self.suffix
+        key_name = UBDS3Volume.block_to_prefix(block_id) + self.suffix
         return bucket.new_key(key_name)
 
     def read_block(self, bucket, block_id):
