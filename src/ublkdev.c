@@ -867,6 +867,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
         if (reply->ubd_status < 0) {
             /* Error received */
             result = reply->ubd_status;
+            n_bytes = n_sectors * 512;
         } else if (reply->ubd_status != n_sectors) {
             /* Sector count mismatch. */
             printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u sectors; "
@@ -874,6 +875,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                    reply->ubd_status);
 
             result = -EIO;
+            n_bytes = n_sectors * 512;
         } else if (bio_data_dir(bio) == READ) {
             /* Read request */
             uint32_t recv_data = reply->ubd_header.ubd_size -
