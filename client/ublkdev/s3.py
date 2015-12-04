@@ -12,7 +12,7 @@ from re import match
 from six.moves import cStringIO as StringIO
 from struct import pack, unpack
 from sys import argv, exit, stderr, stdin, stdout
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 from .ublkdev import (
     UBD_MSGTYPE_READ_REQUEST, UBD_MSGTYPE_WRITE_REQUEST,
     UBD_MSGTYPE_DISCARD_REQUEST, UBD_MSGTYPE_READ_REPLY,
@@ -42,11 +42,11 @@ class UBDS3Handler(Thread):
         volume = self.volume
 
         while not volume.stop_requested:
-            with volume.lock:
+            with volume.request_lock:
                 try:
                     request = volume.request_queue.pop()
                 except IndexError:
-                    volume.lock.wait(1)
+                    volume.request_lock.wait(1)
                     continue
             
             volume.handle_ubd_request(self.bucket, request)
@@ -72,7 +72,8 @@ class UBDS3Volume(object):
         self.suffix = None
 
         self.request_queue = []
-        self.lock = Condition()
+        self.request_lock = Condition()
+        self.reply_lock = Lock()
         self.stop_requested = False
         return
 
@@ -100,9 +101,9 @@ class UBDS3Volume(object):
 
             while not self.stop_requested:
                 request = self.ubd.next()
-                with self.lock:
+                with self.request_lock:
                     self.request_queue.append(request)
-                    self.lock.notify()
+                    self.request_lock.notify()
         finally:
             self.stop_requested = True
             for thread in self.threads:
@@ -188,8 +189,11 @@ class UBDS3Volume(object):
 
         reply = UBDReply(msgtype=reply_type, size=reply_size, tag=req.tag,
                          status=reply_status, data=reply_data)
-        reply.write_to(self.ubd)
-        self.ubd.flush()
+
+        with self.reply_lock:
+            reply.write_to(self.ubd)
+            self.ubd.flush()
+            
         return
 
     def read(self, bucket, offset, length):
@@ -256,7 +260,7 @@ class UBDS3Volume(object):
                 block_data = (block_data[:start_pos] + spliced +
                               block_data[end_pos:])
             else:
-                block_data = to_write.read(self.segment_size)
+                block_data = to_write.read(self.block_size)
 
             self.write_block(bucket, block_id, block_data)
 

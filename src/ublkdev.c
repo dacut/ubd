@@ -281,7 +281,6 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
     mutex_init(&dev->status_lock);
     dev->flags = 0;
     atomic_set(&dev->n_pending, 0);
-    init_waitqueue_head(&dev->n_pending_wait);
 
     return 0;
 }
@@ -804,7 +803,8 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
     uint32_t tag;
     int result = -EINVAL;
     unsigned int n_bytes = 0;
-    bool is_unfinished;
+    bool unfinished;
+    int n_pending;
 
     BUG_ON(dev == NULL);
     BUG_ON(reply == NULL);
@@ -867,7 +867,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
         if (reply->ubd_status < 0) {
             /* Error received */
             result = reply->ubd_status;
-            n_bytes = n_sectors * 512;
+            n_bytes += n_sectors * 512;
         } else if (reply->ubd_status != n_sectors) {
             /* Sector count mismatch. */
             printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u sectors; "
@@ -875,7 +875,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                    reply->ubd_status);
 
             result = -EIO;
-            n_bytes = n_sectors * 512;
+            n_bytes += n_sectors * 512;
         } else if (bio_data_dir(bio) == READ) {
             /* Read request */
             uint32_t recv_data = reply->ubd_header.ubd_size -
@@ -902,7 +902,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                 bvec_kunmap_irq(buffer, &flags);
 
                 result = 0;
-                n_bytes = recv_data;
+                n_bytes += recv_data;
             }
         } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
             if (msgtype != UBD_MSGTYPE_DISCARD_REPLY) {
@@ -911,7 +911,7 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                 result = -EIO;
             } else {
                 result = 0;
-                n_bytes = 512 * n_sectors;
+                n_bytes += 512 * n_sectors;
             }
         } else {
             if (msgtype != UBD_MSGTYPE_WRITE_REPLY) {
@@ -920,19 +920,25 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
                 result = -EIO;
             } else {
                 result = 0;
-                n_bytes = 512 * n_sectors;
             }
+
+            n_bytes += 512 * n_sectors;
         }
     }
 
     BUG_ON(result == -EINVAL);
-    is_unfinished = blk_end_request(rq, result, n_bytes);
-    BUG_ON(is_unfinished);
+    unfinished = blk_end_request(rq, result, n_bytes);
+    if (unfinished) {
+        printk(KERN_ERR "[%d] ubdctl_handle_reply: blk_end_request didn't "
+               "finish; tag=%d, n_bytes=%u\n", current->pid, rq->tag, n_bytes);
+    }
+    BUG_ON(unfinished);
 
     /* ubdblk_handle_fs_request might be waiting for a tag.  Notify it
        that we just made one available. */
-    atomic_dec(&dev->n_pending);
-    wake_up_interruptible(&dev->n_pending_wait);
+    n_pending = atomic_dec_return(&dev->n_pending);
+    printk(KERN_DEBUG "[%d] ubdctl_handle_reply: n_pending now %d\n",
+           current->pid, n_pending);
 
     return;
 }
@@ -1305,19 +1311,12 @@ static void ubdblk_handle_request(struct request_queue *rq) {
     while ((req = blk_peek_request(rq)) != NULL) {
         bool unfinished;
 
-        spin_unlock_irq(rq->queue_lock);
-        printk(KERN_INFO "[%d] ublkdev_handle_request: queue spinlock "
-               "released\n", current->pid);
-
+        // spin_unlock_irq(rq->queue_lock);
         is_running = ((ubd_get_status(dev) & UBD_STATUS_RUNNING) != 0);
 
         if (unlikely(! is_running)) {
             /* Device is not running; fail the request. */
-            printk(KERN_INFO "[%d] ubdblk_handle_request: device is not "
-                   "running; failing request\n", current->pid);
             blk_start_request(req);
-            printk(KERN_INFO "[%d] ublkdev_handle_request: ending request\n",
-                   current->pid);
             unfinished = blk_end_request_err(req, -EIO);
             BUG_ON(unfinished);
             printk(KERN_INFO "[%d] ublkdev_handle_request: request failed.\n",
@@ -1338,9 +1337,7 @@ static void ubdblk_handle_request(struct request_queue *rq) {
             }
         }
         
-        printk(KERN_INFO "[%d] ublkdev_handle_request: reacquiring queue "
-               "spinlock\n", current->pid);
-        spin_lock_irq(rq->queue_lock);
+        // spin_lock_irq(rq->queue_lock);
     }
 
     return;
@@ -1352,19 +1349,32 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
     struct req_iterator iter;
     struct ubd_outgoing_message *msg;
     struct ubd_request *ureq;
+    int n_pending;
 
     BUG_ON(dev == NULL);
     BUG_ON(rq == NULL);
+
+    /* Allocate a tag for this request. */
+    BUG_ON(dev->blk_pending == NULL);
 
     rq_for_each_segment(bvec, rq, iter) {
         struct bio *bio = iter.bio;
         size_t req_size = sizeof(*ureq);
         void *data = NULL;
-        int tag_result;
         bool unfinished;
 
         BUG_ON(bio == NULL);
         BUG_ON(bio_segments(bio) != 1);
+
+        if (blk_queue_start_tag(dev->blk_pending, rq)) {
+            // Couldn't allocate the tag.  Don't pull it off the queue.
+            printk(KERN_INFO "[%d] ubdblk_handle_fs_request: failed to "
+                   "allocate a tag.\n", current->pid);
+            return;
+        }
+
+        printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: request tag=%d, "
+               "size=%d\n", current->pid, rq->tag, bio_sectors(rq->bio) * 512);
 
         /* Allocate the message structure */
         if ((msg = kmalloc(sizeof(*msg), GFP_NOIO)) == NULL) {
@@ -1396,38 +1406,6 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
             return;
         }
 
-        /* Allocate a tag for this request */
-        BUG_ON(dev->blk_pending == NULL);
-
-        while (true) {
-            spin_lock(dev->blk_pending->queue_lock);
-            tag_result = blk_queue_start_tag(dev->blk_pending, rq);
-            spin_unlock(dev->blk_pending->queue_lock);
-        
-            if (tag_result == 0) {
-                break;
-            }
-            
-            /* Out of tags; wait for a new tag. */
-            printk(KERN_INFO "[%d] ubdblk_handle_fs_request: could not get a "
-                   "tag for a request: tag_result=%d n_pending=%d -- will"
-                   "sleep\n",  current->pid, tag_result,
-                   (int) atomic_read(&dev->n_pending));
-
-            if (wait_event_interruptible(
-                    dev->n_pending_wait,
-                    atomic_read(&dev->n_pending) < UBD_MAX_TAGS))
-            {
-                // Interrupted
-                kfree(ureq);
-                kfree(msg);
-                blk_start_request(rq);
-                unfinished = blk_end_request_err(rq, -ERESTARTSYS);
-                BUG_ON(unfinished);
-                return;
-            }
-        }
-
         /* Initialize the request */
         msg->n_written = 0;
         msg->request = ureq;
@@ -1447,7 +1425,9 @@ static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
         /* Queue the request for the control endpoint. */
         mutex_lock(&dev->outgoing_lock);
         list_add_tail(&msg->list, &dev->ctl_outgoing_head);
-        atomic_inc(&dev->n_pending);
+        n_pending = atomic_inc_return(&dev->n_pending);
+        printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: n_pending now %d\n",
+               current->pid, n_pending);
         mutex_unlock(&dev->outgoing_lock);
         wake_up_interruptible(&dev->ctl_outgoing_wait);
     }

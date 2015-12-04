@@ -138,7 +138,7 @@ struct ublkdev {
 
     /** Wait queue for notifying ubdblk_handle_fs_request that n_pending
         has decremented. */
-    wait_queue_head_t n_pending_wait;    
+    // wait_queue_head_t n_pending_wait;
 };
 
 #endif /* UBLKDEV_PRIVATE_H */
