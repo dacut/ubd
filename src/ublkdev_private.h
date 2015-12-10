@@ -58,30 +58,6 @@
 #define UBD_STATUS_TRANSIENT \
     (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING | UBD_STATUS_UNREGISTERING)
 
-/** Wraps a UBD message in a Linux linked list.
- */
-struct ubd_outgoing_message {
-    /** For managing this in a linked list. */
-    struct list_head list;
-
-    /** How much of the message has been written to userspace. */
-    uint64_t n_written;
-
-    /** The request */
-    struct ubd_request *request;
-};
-
-struct ubd_incoming_message {
-    /** How much of the message has been read from userspace. */
-    uint32_t n_read;
-
-    /** The capacity of the message structure. */
-    uint32_t capacity;
-
-    /** The reply */
-    struct ubd_reply *reply;
-};
-
 /** Structure connecting a control (character device) endpoint to a block
  *  endpoint.
  */
@@ -98,47 +74,33 @@ struct ublkdev {
     /** Work structure for scheduling add_disk() asynchronously. */
     struct work_struct add_disk_work;
 
-    /** List of messages waiting to be sent to the control endpoint. */
-    struct list_head ctl_outgoing_head;
-
-    /** Message currently being written. */
-    struct ubd_outgoing_message *ctl_current_outgoing;
-
-    /** Wait queue for notifying ubdctl_read when a new message is available.
+    /** A list of requests waiting to be delivered.
      */
-    wait_queue_head_t ctl_outgoing_wait;
+    struct request_queue *pending_delivery;
 
-    /** Lock for ctl_outgoing_head, ctl_current_outgoing. */
-    struct mutex outgoing_lock;
+    /** An array of requests waiting for replies.
+     *
+     *  The index of the array corresponds to the tag delivered to the handler.
+     */
+    struct request **pending_reply;
 
-    /** Pending message being read from the control endpoint. */
-    struct ubd_incoming_message ctl_incoming;
+    /** The maximum number of pending replies. */
+    uint32_t max_pending_reply;
 
-    /** Lock for ctl_incoming */
-    struct mutex incoming_lock;
+    /** Number of messages awaiting a reply. */
+    uint32_t n_pending_reply;
 
-    /** A list of requests waiting to be handled or replied to. */
-    struct request_queue *blk_pending;
-
-    /** Status of this device.  status_lock must be held to read or write
-        this. */
-    volatile uint32_t status;
-
-    /** Spin lock for changing the status. */
-    struct mutex status_lock;
+    /** Status of this device.
+     *
+     *  @c status_wait.lock must be held to read or write this.
+     */
+    uint32_t status;
 
     /** Wait queue for notifying anyone waiting on a status change. */
     wait_queue_head_t status_wait;
 
     /** Flags passed when registering. */
     uint32_t flags;
-
-    /** Number of messages awaiting a reply. */
-    atomic_t n_pending;
-
-    /** Wait queue for notifying ubdblk_handle_fs_request that n_pending
-        has decremented. */
-    wait_queue_head_t n_pending_wait;    
 };
 
 #endif /* UBLKDEV_PRIVATE_H */

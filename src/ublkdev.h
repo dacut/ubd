@@ -18,10 +18,16 @@
 #define UBD_IOCUNREGISTER   _IO(UBD_IOC_MAGIC, 0xa1)
 
 /** ioctl: get registered block device count. */
-#define UBD_IOCGETCOUNT    _IOR(UBD_IOC_MAGIC, 0xa2, int)
+#define UBD_IOCGETCOUNT     _IOR(UBD_IOC_MAGIC, 0xa2, int)
 
 /** ioctl: describe block device. */
 #define UBD_IOCDESCRIBE     _IOWR(UBD_IOC_MAGIC, 0xa3, struct ubd_describe)
+
+/** ioctl: get next request. */
+#define UBD_IOCGETREQUEST   _IOWR(UBD_IOC_MAGIC, 0xa5, struct ubd_message)
+
+/** ioctl: put reply. */
+#define UBD_IOCPUTREPLY     _IOW(UBD_IOC_MAGIC, 0xa6, struct ubd_message)
 
 /** ubd_flags: device is read only. */
 #define UBD_FL_READ_ONLY    0x00000001
@@ -37,14 +43,11 @@ struct ubd_info {
     /** Device flags */
     uint32_t ubd_flags;
 
-    /** Device capacity in 512-byte sectors. */
-    uint64_t ubd_nsectors;
-
     /** Major number */
     uint32_t ubd_major;
 
-    /** Minor number */
-    uint32_t ubd_minor;
+    /** Device capacity in 512-byte sectors. */
+    uint64_t ubd_nsectors;
 };
 
 struct ubd_describe {
@@ -55,68 +58,67 @@ struct ubd_describe {
     struct ubd_info ubd_info;
 };
 
-/** ubd_msgtype code for a read request. */
-#define UBD_MSGTYPE_READ_REQUEST            0
+/** ubd_msgtype code for replies. */
+#define UBD_MSGTYPE_REPLY                   0x80000000
 
-/** ubd_msgtype code for a write request. */
-#define UBD_MSGTYPE_WRITE_REQUEST           1
+/** ubd_msgtype code for a read request/reply. */
+#define UBD_MSGTYPE_READ                    0
 
-/** ubd_msgtype code for a discard (trim) request. */
-#define UBD_MSGTYPE_DISCARD_REQUEST         2
-
-/** ubd_msgtype code for a read reply. */
-#define UBD_MSGTYPE_READ_REPLY              0x80000000
-
-/** ubd_msgtype code for a write reply. */
-#define UBD_MSGTYPE_WRITE_REPLY             0x80000001
+/** ubd_msgtype code for a write request/reply. */
+#define UBD_MSGTYPE_WRITE                   1
 
 /** ubd_msgtype code for a discard (trim) request. */
-#define UBD_MSGTYPE_DISCARD_REPLY           0x80000002
+#define UBD_MSGTYPE_DISCARD                 2
 
 /** Maximum size of a UBD message */
 #define UBD_MAX_MESSAGE_SIZE                ((size_t) (4 << 20))   /* 4 MB */
 
-/** Common header for all UBD control messages.
+/** UBD request / reply
  *  
- *  Requests are made by the driver and sent to userspace upon a read()
- *  on the control endpoint.  Replies are sent from userspace through a
- *  write() on the control endpoint.
+ *  Requests are made by the driver and sent to userspace when the handler
+ *  invokes the @c UBD_IOCGETREQUEST @c ioctl.  Replies are sent from userspace
+ *  through a @c UBD_IOCPUTREQUEST @c ioctl.
  */
-struct ubd_header {
-    /** The type of this message. */
+struct ubd_message {
+    /** The type of this message.
+     *
+     *  @li @c UBD_IOCGETREQUEST [OUT]
+     *  @li @c UBD_IOCPUTREPLY [IN]
+     */
     uint32_t ubd_msgtype;
     
-    /** Size of the entire message in bytes. */
-    uint32_t ubd_size;
-
-    /** Tag to match up requests with replies. */
+    /** Tag to match up requests with replies.
+     *
+     *  @li @c UBD_IOCGETREQUEST [OUT]
+     *  @li @c UBD_IOCPUTREPLY [IN]
+     */
     uint32_t ubd_tag;
-};
 
-struct ubd_request {
-    /** Common header */
-    struct ubd_header ubd_header;
-    
-    /** Number of 512-byte sectors to read. */
+    /** Number of 512-byte sectors to read.
+     *
+     *  @li @c UBD_IOCGETREQUEST [OUT]
+     *  @li @c UBD_IOCPUTREPLY Unused
+     */
     uint32_t ubd_nsectors;
-
-    /** First sector of the request. */
+    
+    /** First sector of the request.
+     *
+     *  @li @c UBD_IOCGETREQUEST [OUT]
+     *  @li @c UBD_IOCPUTREPLY Unused
+     */
     uint64_t ubd_first_sector;
 
-    /** Data for this request. */
-    char ubd_data[0];
-};
-
-struct ubd_reply {
-    /** Common header */
-    struct ubd_header ubd_header;
-
-    /** Size in 512-byte sectors of data written, or (if negative) an error
-     *  code.
+    /** Number of bytes in @c ubd_data.
+     *
+     *  @li @c UBD_IOCGETREQUEST [IN OUT] When called, this indicates the
+     *      capacity of @c ubd_data.  Upon return, this indicates the number
+     *      of valid bytes in @c ubd_data (zero for read and trim requests;
+     *      non-zero for write requests).
+     *  @li @c UBD_IOCPUTREPLY [IN] The number of valid bytes in @c ubd_data.
+     *      This is valid only for write replies.
      */
-    int32_t ubd_status;
 
-    /** Data for this reply. */
+    /** Data for this request. */
     char ubd_data[0];
 };
 
