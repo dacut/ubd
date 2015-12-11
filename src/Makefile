@@ -1,6 +1,9 @@
 ifneq ($(KERNELRELEASE),)
+KBUILD_CFLAGS += -fno-inline
 obj-m := ublkdev.o
 else
+# Get the kernel version and create a preprocessor macro for it.  This allows
+# us to target multiple Linux kernel versions.
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 KERNEL_VERSION= $(shell printf "0x%02x%02x" $(shell uname -r | sed -e 's/\..*//') $(shell uname -r | sed -e 's/^[^\.]*\.\([^\.]*\)\..*/\1/'))
