@@ -15,6 +15,12 @@
 #include <linux/workqueue.h>
 #include "ublkdev.h"
 
+/** List of all ublkdev devices. */
+extern struct list_head ubd_devices;
+
+/** Mutex for reading or writing @c ubd_devices. */
+extern struct mutex ubd_devices_lock;
+
 /** Initial capacity of pending replies. */
 #define UBD_INITIAL_PENDING_REPLY_CAPACITY 64
 #define UBD_INITIAL_PENDING_REPLY_SIZE \
@@ -96,10 +102,18 @@ struct ublkdev {
     /** Flags passed when registering. */
     uint32_t flags;
 
-    /** Number of control enpoints tied to this device. */
+    /** Number of control enpoints tied to this device.
+     *
+     *  @c wait.lock must be held to read this.
+     *  @c ubd_devices_lock and @wait.lock must be held to modify this.
+     */
     uint32_t n_control_handles;
 
-    /** Number of block filehandles open. */
+    /** Number of block filehandles open.
+     *
+     *  @c wait.lock must be held to read or write this.
+     *  @c ubd_devices_lock and @wait.lock must be held to modify this.
+     */
     uint32_t n_block_handles;
 };
 

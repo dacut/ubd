@@ -70,10 +70,33 @@ static inline uint32_t ubd_get_status(struct ublkdev *dev) {
     uint32_t status;
     
     mutex_lock(&dev->status_lock);
-    status = READ_ONCE(dev->status);
+    status = ACCESS_ONCE(dev->status);
     mutex_unlock(&dev->status_lock);
 
     return status;
+}
+
+/** Helper for retreiving a block device given its major number.
+ *
+ *  @c ubd_devices_lock must be held while invoking this function.
+ *
+ *  @param  major   The major number of the device to return.
+ *  @return The @c ublkdev object corresponding to the major number, or
+ *          @c NULL if a corresponding device does not exist.
+ */
+static ublkdev *ubd_find_device_by_major(uint32_t major) {
+    struct list_head *el;
+    
+    BUG_ON(! mutex_is_locked(&ubd_devices_lock));
+
+    list_for_each(el, &ubd_devices) {
+        ublkdev *dev = list_entry(el, struct ublkdev *, list);
+        if (dev->disk != NULL && dev->disk->major == major) {
+            return dev;
+        }
+    }
+
+    return NULL;
 }
 
 /* ***** Control endpoint functions ***** */
@@ -271,7 +294,7 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
 
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         smp_rmb();
-        status = READ_ONCE(dev->status);
+        status = ACCESS_ONCE(dev->status);
 
         poll_wait(filp, &dev->status_wait, wait);
 
@@ -465,55 +488,81 @@ static long ubdctl_ioctl_unregister(
     unsigned long lock_flags;
     struct request *req;
     bool unfinished;
-        
+
+    mutex_lock(&ubd_devices_lock);
+
     dev = ubd_find_device_by_major(major);
     if (dev == NULL) {
+        mutex_unlock(&ubd_devices_lock);
         ubd_info("Unknown major device %d", major);
         return -EINVAL;
     }
 
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
     smp_rmb();
-    status = READ_ONCE(dev->status);
+    status = ACCESS_ONCE(dev->status);
 
     if (status == UBD_STATUS_REGISTERING) {
         ubd_info("Cannot unregister device major %d; still registering "
                  "device.", major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
         return -EBUSY;
     } else if (status == UBD_STATUS_ADDING) {
         ubd_info("Cannot unregister device major %d; still adding "
                  "device.", major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
         return -EBUSY;
     } else if (status == UBD_STATUS_UNREGISTERING) {
         ubd_info("Cannot unregister device major %d; already unregistering.",
                  major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
         return -EBUSY;
     } else if (status == UBD_STATUS_TERMINATED) {
         ubd_info("Cannot unregister device major %d; already terminated.",
                  major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
         return -EBUSY;
     }
-        
+    
     /* Start the unregister process. */
     WRITE_ONCE(dev->status, UBD_STATUS_UNREGISTERING);
     smp_wmb();
 
+    /* Increase the control handle count while unregistering so we don't
+     * release the structure while we're still in this routine.
+     */
+    WRITE_ONCE(dev->n_control_handles, READ_ONCE(dev->n_control_handles) + 1);
+    smp_wmb();
+
     /* Don't deliver any messages pending delivery. */
     while (dev->pending_delivery_head != NULL) {
-        req = dev->pending_delivery_head;
-        dev->pending_delivery_head = (struct request *) req->special;
+        /* Pop the top of the pending_delivery list.  The special field
+         * is used to point to the next request.
+         */
+        struct request *next_request;
+        
+        smp_rmb();
+        req = READ_ONCE(dev->pending_delivery_head);
+        next_request = (struct request *) READ_ONCE(req->special);
 
-        if (dev->pending_delivery_head == NULL) {
+        WRITE_ONCE(dev->pending_delivery_head, next_request);
+
+        if (next_request == NULL) {
             /* Removed the last item; axe the tail. */
-            dev->pending_delivery_tail = NULL;
+            WRITE_ONCE(dev->pending_delivery_tail, NULL);
         }
 
         smp_wmb();
+
+        /* We can't have device or device list locks held while holding the
+         * queue lock.
+         */
         spin_lock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
 
         /* Fail this request.  This requires the queue lock to be held. */
         spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
@@ -522,6 +571,8 @@ static long ubdctl_ioctl_unregister(
 
         BUG_ON(unfinished);
 
+        /* Reacquire the device and device list lcoks. */
+        mutex_lock(&ubd_devices_lock);
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
     }
 
