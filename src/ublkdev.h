@@ -15,7 +15,7 @@
 #define UBD_IOCREGISTER     _IOWR(UBD_IOC_MAGIC, 0xa0, struct ubd_info)
 
 /** ioctl: unregister block device. */
-#define UBD_IOCUNREGISTER   _IO(UBD_IOC_MAGIC, 0xa1)
+#define UBD_IOCUNREGISTER   _IOW(UBD_IOC_MAGIC, 0xa1, int)
 
 /** ioctl: get registered block device count. */
 #define UBD_IOCGETCOUNT     _IOR(UBD_IOC_MAGIC, 0xa2, int)

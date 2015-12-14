@@ -182,27 +182,18 @@ static struct block_device_operations ubdblk_fops = {
 static int __init ubd_init(void) {
     int result;
 
-    printk(KERN_INFO "ubd_reply: header at 0x%zx (0x%zx bytes)\n",
-           offsetof(struct ubd_reply, ubd_header), sizeof(struct ubd_header));
-    printk(KERN_INFO "ubd_reply: status at 0x%zx\n",
-           offsetof(struct ubd_reply, ubd_status));
-    printk(KERN_INFO "ubd_reply: data at 0x%zx\n",
-           offsetof(struct ubd_reply, ubd_data));
-
     /* Register the control endpoint */
     if ((result = misc_register(&ubdctl_miscdevice)) < 0) {
-        printk(KERN_ERR "[%d] ubdctl failed to register misc device: "
-               "error code %d\n", current->pid, result);
+        ubd_err("Failed to register misc device: error code %d", result);
         goto error;
     }
 
-    printk(KERN_DEBUG "[%d] ubdctl registered as device %d:%d\n",
-           current->pid, MISC_MAJOR, ubdctl_miscdevice.minor);
+    ubd_debug("ubdctl registered as device %d:%d", MISC_MAJOR,
+              ubdctl_miscdevice.minor);
 
     /* Register the block device */
     if ((result = register_blkdev(ubd_major, "ubd")) < 0) {
-        printk(KERN_ERR "[%d] ubd failed to register block device: "
-               "error code %d\n", current->pid, result);
+        ubd_err("Failed to register block device: error code %d", result);
         goto error;
     }
 
@@ -210,8 +201,7 @@ static int __init ubd_init(void) {
         ubd_major = result;
     }
 
-    printk(KERN_DEBUG "[%d] ubd registered as block device %d\n",
-           current->pid, ubd_major);
+    ubd_debug("ubd block registered as device major %d", ubd_major);
 
     return 0;
 
@@ -229,12 +219,14 @@ static void __exit ubd_exit(void) {
 
 static void ubd_teardown(void) {
     if (ubd_major != 0) {
-        printk(KERN_DEBUG "ubd unregistering block device %d\n", ubd_major);
+        ubd_debug("Unregistering block device (major %d)", ubd_major);
         unregister_blkdev(ubd_major, "ubd");
         ubd_major = 0;
     }
 
     if (ubdctl_miscdevice.minor != MISC_DYNAMIC_MINOR) {
+        ubd_debug("Unregistering ubdctl device %d:%d", MISC_MAJOR,
+                  ubdctl_miscdevice.minor);
         misc_deregister(&ubdctl_miscdevice);
     }
 
@@ -245,6 +237,8 @@ module_init(ubd_init);
 module_exit(ubd_exit);
 
 static int ubdctl_open(struct inode *inode, struct file *filp) {
+    /* Initially unassociated with a device. */
+    filp->private_data = NULL;
     return 0;
 }
 
@@ -267,120 +261,319 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     struct ublkdev *dev = filp->private_data;
     unsigned int result = 0;
-    unsigned long lock_flags;
 
-    if (dev != NULL) {
-        /* Indicate when data is available. */
-        spin_lock_irqsave(&dev->status_wait.lock, lock_flags);
+    if (dev == NULL) {
+        /* Endpoint isn't tied to a device. */
+        result |= POLLHUP;
+    } else {
+        unsigned long lock_flags;
+        uint32_t status;
 
-        poll_wait(filp, &dev->ctl_outgoing_wait, wait);
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        smp_rmb();
+        status = READ_ONCE(dev->status);
 
-    mutex_lock(&dev->outgoing_lock);
-    if (dev->ctl_current_outgoing != NULL ||
-        ! list_empty(&dev->ctl_outgoing_head))
-    {
-        result |= (POLLIN | POLLRDNORM);
+        poll_wait(filp, &dev->status_wait, wait);
+
+        if (status == UBD_STATUS_RUNNING) {
+            result |= POLLOUT | POLLWRNORM;
+            
+            if (dev->pending_delivery_head != NULL) {
+                result |= POLLIN | POLLRDNORM;
+            }
+        } else if (status == UBD_STATUS_UNREGISTERING) {
+            /* Device is being torn down. */
+            result |= POLLHUP;
+        }
+
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
-    mutex_unlock(&dev->outgoing_lock);
-
-    /* XXX: Reevaluate should we create a queue for outgoing replies. */
-    result |= POLLOUT | POLLWRNORM;
 
     return result;
 }
 
 
-static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
-                         unsigned long data)
+static long ubdctl_ioctl(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
 {
-    struct ublkdev *dev = filp->private_data;
-
     printk(KERN_DEBUG "[%d] ubdctl_ioctl: ioctl(%u, 0x%lx)\n",
            current->pid, cmd, data);
 
-    BUG_ON(dev == NULL);
-
     switch (cmd) {
-    case UBD_IOCREGISTER: {
-        struct ubd_info info;
-        long result;
+    case UBD_IOCREGISTER:
+        return ubdctl_ioctl_register(filp, cmd, data);
 
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCREGISTER -- copying "
-               "structures from userspace\n", current->pid);
+    case UBD_IOCUNREGISTER:
+        return ubdctl_ioctl_unregister(filp, cmd, data);
+
+    case UBD_IOCGETCOUNT:
+        return ubdctl_ioctl_getcount(filp, cmd, data);
+
+    case UBD_IOCDESCRIBE:
+        return ubdctl_ioctl_describe(filp, cmd, data);
+
+    case UBD_IOCTIE:
+        return ubdctl_ioctl_tie(filp, cmd, data);
+
+    case UBD_IOCGETREQUEST:
+        return ubdctl_ioctl_getrequest(filp, cmd, data);
+
+    case UBD_IOCPUTREPLY:
+        return ubdctl_ioctl_putreply(filp, cmd, data);
+
+    default:
+        break;
+    }
+    
+    printk(KERN_INFO "[%d] ubdctl_ioctl: unknown ioctl 0x%x\n",
+           current->pid, cmd);
+    return -EINVAL;
+}
+
+static long ubdctl_ioctl_register(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    struct ubd_info info;
+    size_t name_length;
+    int major;
+    struct gendisk *disk;
+
+    ubd_debug("Copying structures from userspace.");
+
+    /* Get the disk info from userspace. */
+    if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
+        ubd_notice("Invalid userspace address.");
+        return -EFAULT;
+    }
+    
+    /* Make sure the name is NUL terminated. */
+    name_length = strnlen(info.ubd_name, DISK_NAME_LEN);
+    if (name_length == 0) {
+        ubd_notice("Name cannot be empty.");
+        return -EINVAL;
+    } else if (name_length >= DISK_NAME_LEN) {
+        ubd_notice("Name is not NUL terminated.");
+        return -EINVAL;
+    }
+
+    /* Register the new block device. */
+    if ((major = register_blkdev(0, info.ubd_name)) < 0) {
+        ubd_notice("Failed to register %s: error code %d.\n", info.ubd_name,
+                   -major);
+        return major;
+    }
+
+    /* Allocate the block device structure.  Require this to reside in RAM so
+     * we don't end up swapping to another (possibly this?) ublkdev.
+     */
+    dev = kmalloc(sizeof(*dev), GFP_NOIO);
+    if (dev == NULL) {
+        ubd_err("Failed to allocate %zu bytes for struct ublkdev.",
+                sizeof(*dev));
+        return -ENOMEM;
+    }
+
+    /* Allocate and initialize the reply array. */
+    if ((dev->pending_reply = kmalloc(UBD_INITIAL_PENDING_REPLY_SIZE)) == NULL)
+    {
+        ubd_err("Failed to allocate %zu bytes for reply array.",
+                UBD_INITIAL_PENDING_REPLY_SIZE);
+        kfree(dev);
+        return -ENOMEM;
+    }
+    dev->max_pending_reply = UBD_INITIAL_PENDING_REPLY_CAPACITY;
+    dev->n_pending_reply = 0u;
+
+    /* Allocate and initialize the request queue. */
+    if ((dev->in_flight = blk_init_queue(ubdblk_handle_request, NULL)) == NULL)
+    {
+        ubd_err("Failed to allocate block request queue.");
+        kfree(dev);
+        return -ENOMEM;
+    }
+    
+    /* Allocate the disk structure.
+     * XXX: Allow users to register more than 1 minor.
+     */
+    if ((dev->disk = disk = alloc_disk(1)) == NULL) {
+        ubd_err("Failed to allocate gendisk structure.");
+        blk_cleanup_queue(dev->in_flight);
+        kfree(dev);
+        return -ENOMEM;
+    }
+
+    /* Initialize the rest of the structure. */
+    disk->major = major;
+    disk->first_minor = 0;
+    memcpy(disk->disk_name, ubd_info.ubd_name, DISK_NAME_LEN);
+    disk->devnode = ubdblk_get_devnode;
+    disk->fops = &ubdblk_fops;
+    disk->queue = dev->in_flight;
+    disk->flags = (info.ubd_flags & UBD_FL_REMOVABLE) ? GENHD_FL_REMOVABLE : 0;
+    set_capacity(disk, info.ubd_nsectors);
+    disk->private_data = dev;
+
+    /* Asynchronously add the disk.  Otherwise, there can be a race condition
+     * where udev attempts to read the disk before this ioctl returns.
+     */
+    INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
+    schedule_work(&dev->add_disk_work);
+
+    /* No requests pending delivery. */
+    dev->pending_delivery_head = dev->pending_delivery_tail = NULL;
+    
+    /* Mark this device as registering. */
+    dev->status = UBD_STATUS_REGISTERING;
+
+    /* Initialize the status change wait queue. */
+    init_waitqueue_head(&dev->wait);
+
+    /* Copy flags over. */
+    dev->flags = info.flags;
+
+    /* Nobody has this open or tied yet. */
+    dev->n_control_handles = 0;
+    dev->n_block_handles = 0;
+
+    /* Add this device to the global list of devices. */
+    mutex_lock(&ubd_devices_lock);
+    list_add_tail(& dev->list, &ubd_devices);
+    smp_wmb();
+    mutex_unlock(&ubd_devices_lock);
+
+    /* Copy the major number back to user space. */
+    info.ubd_major = major;
+    copy_to_user((void *) data, &info, sizeof(info)) {
+        ubd_err("Userspace structure became invalid.");
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+static long ubdctl_ioctl_unregister(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    int major = (int) data;
+    struct ubdblk *dev;
+    unsigned long lock_flags;
+    struct request *req;
+    bool unfinished;
         
-        /* Get the disk info from userspace. */
-        if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace address\n",
-                   current->pid);
-            return -EFAULT;
-        }
-
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: ubd_info: ubd_name=\"%.8s\", "
-               "ubd_flags=0x%x, ubd_nsectors=%llu, ubd_major=%ud, "
-               "ubd_minor=%ud\n", current->pid, info.ubd_name, info.ubd_flags,
-               (unsigned long long) info.ubd_nsectors, info.ubd_major,
-               info.ubd_minor);
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: registering device\n",
-               current->pid);
-
-        result = ubdctl_register(dev, &info);
-        if (result == 0) {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: register call succeeded; "
-                   "copying results back to userspace\n", current->pid);
-            /* Copy the disk info back to userspace. */
-            if (copy_to_user((void *) data, &info, sizeof(info)) != 0) {
-                printk(KERN_ERR "[%d] ubdctl_ioctl: userspace address became "
-                       "invalid\n", current->pid);
-                return -EFAULT;
-            }
-        } else {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: register call failed; "
-                   "errno=%d.\n", current->pid, (int) -result);
-        }
-
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: returning %ld\n", current->pid,
-               result);
-        return result;
+    dev = ubd_find_device_by_major(major);
+    if (dev == NULL) {
+        ubd_info("Unknown major device %d", major);
+        return -EINVAL;
     }
 
-    case UBD_IOCUNREGISTER: {
-        long result;
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    smp_rmb();
+    status = READ_ONCE(dev->status);
+
+    if (status == UBD_STATUS_REGISTERING) {
+        ubd_info("Cannot unregister device major %d; still registering "
+                 "device.", major);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -EBUSY;
+    } else if (status == UBD_STATUS_ADDING) {
+        ubd_info("Cannot unregister device major %d; still adding "
+                 "device.", major);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -EBUSY;
+    } else if (status == UBD_STATUS_UNREGISTERING) {
+        ubd_info("Cannot unregister device major %d; already unregistering.",
+                 major);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -EBUSY;
+    } else if (status == UBD_STATUS_TERMINATED) {
+        ubd_info("Cannot unregister device major %d; already terminated.",
+                 major);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -EBUSY;
+    }
         
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCUNREGISTER\n",
-               current->pid);
+    /* Start the unregister process. */
+    WRITE_ONCE(dev->status, UBD_STATUS_UNREGISTERING);
+    smp_wmb();
 
-        mutex_lock(&dev->status_lock);
-        result = ubdctl_unregister(dev);
-        mutex_unlock(&dev->status_lock);
+    /* Don't deliver any messages pending delivery. */
+    while (dev->pending_delivery_head != NULL) {
+        req = dev->pending_delivery_head;
+        dev->pending_delivery_head = (struct request *) req->special;
 
-        if (result == 0) {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: unregister succeeded.\n",
-                   current->pid);
-        } else {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: unregister call failed; "
-                   "errno=%d\n", current->pid, (int) -result);
+        if (dev->pending_delivery_head == NULL) {
+            /* Removed the last item; axe the tail. */
+            dev->pending_delivery_tail = NULL;
         }
 
-        return result;
+        smp_wmb();
+        spin_lock_irqrestore(&dev->wait.lock, lock_flags);
+
+        /* Fail this request.  This requires the queue lock to be held. */
+        spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
+        unfinished = blk_end_request_err(req, -EIO);
+        spin_lock_irqrestore(&dev->in_flight.queue_lock, lock_flags);
+
+        BUG_ON(unfinished);
+
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
     }
 
-    case UBD_IOCGETCOUNT: {
-        struct list_head *iter;
-        size_t count = 0;
+    /* Fail any messages awaiting a reply. */
+    for (size_t i = 0; i < dev->max_pending_reply; ++i) {
+        req = dev->pending_reply[i];
 
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT\n",
-               current->pid);
+        if (req != NULL) {
+            uint32_t n_pending_reply;
 
-        mutex_lock(&ubd_devices_lock);
-        list_for_each(iter, &ubd_devices) {
-            ++count;
+            n_pending_reply = READ_ONCE(dev->n_pending_reply);
+            BUG_ON(n_pending_reply == 0);
+
+            --n_pending_reply;
+            WRITE_ONCE(dev->n_pending_reply, n_pending_reply);
+            dev->pending_reply[i] = NULL;
+            smp_wmb();
+                
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
+            /* Fail this request.  This requires the queue lock to be held. */
+            spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
+            unfinished = blk_end_request_err(req, -EIO);
+            spin_lock_irqrestore(&dev->in_flight.queue_lock, lock_flags);
+                
+            BUG_ON(unfinished);
+
+            spin_lock_irqsave(&dev->wait.lock, lock_flags);
         }
-        mutex_unlock(&ubd_devices_lock);
-
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCGETCOUNT -- found %zu "
-               "devices\n", current->pid, count);
-        return count;
     }
+
+    /* Allow the unmount to proceed asynchronously. */
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    return 0;
+}
+
+static long ubdctl_ioctl_getcount(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    struct list_head *iter;
+    size_t count = 0;
+
+    mutex_lock(&ubd_devices_lock);
+    list_for_each(iter, &ubd_devices) {
+        ++count;
+    }
+    mutex_unlock(&ubd_devices_lock);
+
+    return count;
+}
 
     case UBD_IOCDESCRIBE: {
         struct ubd_describe desc;
@@ -595,8 +788,11 @@ static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
 }
 
 
-static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
-    char name[DISK_NAME_LEN + 1];
+static int ubdctl_register(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
     struct gendisk *disk;
     int major;
     int result = -EINVAL;
@@ -689,136 +885,6 @@ static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info) {
     return 0;
 }
 
-
-static int ubdctl_unregister(struct ublkdev *dev) {
-    uint32_t status;
-
-    BUG_ON(dev == NULL);
-
-    // dev->status_lock *MUST* be held.
-    smp_rmb();
-    status = READ_ONCE(dev->status);
-
-    if ((status & (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING)) != 0) {
-        /* Can't unregister a device coming up. */
-        printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
-               "unregister a device in a transient state.\n", current->pid);
-        return -EBUSY;
-    }
-
-    if ((status & (UBD_STATUS_RUNNING | UBD_STATUS_UNREGISTERING)) == 0) {
-        /* Device isn't running. */
-        printk(KERN_INFO "[%d] ubdctl_unregister: attempted to "
-               "unregister a non-running device.\n", current->pid);
-        return -EINVAL;
-    }
-
-    status = (status | UBD_STATUS_UNREGISTERING) & ~UBD_STATUS_RUNNING;
-    WRITE_ONCE(dev->status, status);
-    smp_wmb();
-    
-    wake_up_interruptible(&dev->status_wait);
-
-    /* Are we serving traffic? */
-    if ((status & UBD_STATUS_OPENED) != 0) {
-        struct request *req;
-        
-        printk(KERN_DEBUG "[%d] ubdctl_unregister: unregistering an "
-               "open device\n", current->pid);
-        
-        /* Move the tagged commands back so we can read them again. */
-        blk_queue_invalidate_tags(dev->blk_pending);
-
-        /* Wait for the device to be unmounted. */
-        while (1) {
-            uint32_t status;
-            uint32_t n_failed = 0;
-            bool unfinished;
-
-            smp_rmb();
-            status = READ_ONCE(dev->status);
-
-            if ((dev->status & UBD_STATUS_OPENED) == 0) {
-                break;
-            }
-
-            printk(KERN_DEBUG "[%d] ubdctl_unregister: device is opened; "
-                   "will fail existing requests.\n", current->pid);
-
-            mutex_unlock(&dev->status_lock);
-            spin_lock_irq(dev->blk_pending->queue_lock);
-            /* Reply to all pending messages. */
-            while ((req = blk_fetch_request(dev->blk_pending)) != NULL) {
-                spin_unlock_irq(dev->blk_pending->queue_lock);
-                if (req->cmd_type == REQ_TYPE_FS) {
-                    char const *cmd_type;
-
-                    if (bio_data_dir(req->bio) == WRITE) {
-                        cmd_type = req->bio->bi_rw & REQ_DISCARD ?
-                            "discard" : "write";
-                    } else {
-                        cmd_type = "read";
-                    }
-
-                    printk(KERN_DEBUG "[%d] ubdctl_unregister: flushing "
-                           "%s request", current->pid, cmd_type);
-                } else {
-                    printk(KERN_DEBUG "[%d] ubdctl_unregister: flushing "
-                           "request of type 0x%x", current->pid,
-                           req->cmd_type);
-                }
-                unfinished = blk_end_request_err(req, -EIO);
-                BUG_ON(unfinished);
-                spin_lock_irq(dev->blk_pending->queue_lock);
-                ++n_failed;
-            }
-            spin_unlock_irq(dev->blk_pending->queue_lock);
-
-            printk(KERN_DEBUG "[%d] ubdctl_unregister: failed %u messages.\n",
-                   current->pid, n_failed);
-
-            if (wait_event_interruptible(
-                    dev->status_wait,
-                    (ubd_get_status(dev) & UBD_STATUS_OPENED) == 0))
-            {
-                /* Interrupted; we can pick up again, so leave the device in
-                   the unregistering state. */
-                printk(KERN_INFO "[%d] ubdctl_unregister: unregister "
-                       "interrupted.\n", current->pid);
-                mutex_lock(&dev->status_lock);
-                return -ERESTARTSYS;
-            }
-        }
-    }
-
-    printk(KERN_DEBUG "[%d] ubdctl_unregister: device closed, stopping "
-           "disk.\n", current->pid);
-    BUG_ON((READ_ONCE(dev->status) & UBD_STATUS_OPENED) != 0);
-
-    /* Stop the disk. */
-    del_gendisk(dev->disk);
-    dev->disk = NULL;
-
-    printk(KERN_DEBUG "[%d] ubdctl_unregister: disk stopped; cleaning "
-           "queue\n", current->pid);
-    blk_cleanup_queue(dev->blk_pending);
-
-    /* Clean up the disk structure */
-    dev->flags = 0;
-    WRITE_ONCE(dev->status, 0);
-    dev->blk_pending = NULL;
-    dev->disk = NULL;
-
-    printk(KERN_DEBUG "[%d] ubdctl_unregister: queue cleaned; "
-           "removing device from list of devices\n", current->pid);
-
-    /* Remove this disk structure from the list of devices. */
-    mutex_lock(&ubd_devices_lock);
-    list_del(&dev->list);
-    mutex_unlock(&ubd_devices_lock);
-
-    return 0;
-}
 
 
 static char *ubdblk_get_devnode(struct gendisk *gd, umode_t *mode) {

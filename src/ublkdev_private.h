@@ -15,48 +15,25 @@
 #include <linux/workqueue.h>
 #include "ublkdev.h"
 
-/** Initial capacity for holding an incoming message. */
-#define UBD_INITIAL_MESSAGE_CAPACITY        ((size_t) (128u << 10)) /* 128 kB */
+/** Initial capacity of pending replies. */
+#define UBD_INITIAL_PENDING_REPLY_CAPACITY 64
+#define UBD_INITIAL_PENDING_REPLY_SIZE \
+    ((size_t) sizeof(void *) * UBD_INITIAL_PENDING_REPLY_CAPACITY)
 
-/** Maximum number of pending messages.
- *
- *  FIXME: Make this user-configurable.
- */
-#define UBD_MAX_TAGS                64
+/** Status: Registering; waiting for add_disk() call to start. */
+#define UBD_STATUS_REGISTERING      1
 
-/** Status: Registering; waiting for add_disk() call to start.
- *
- *  Cannot be combined with any other flags.
- */
-#define UBD_STATUS_REGISTERING      0x01
+/** Status: Add disk call in progress. */
+#define UBD_STATUS_ADDING           2
 
-/** Status: Add disk call in progress.
- *
- *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_UNREGISTERING.
- */
-#define UBD_STATUS_ADDING           0x02
+/** Status: Running. */
+#define UBD_STATUS_RUNNING          3
 
-/** Status: Running.
- *
- *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_UNREGISTERING.
- */
-#define UBD_STATUS_RUNNING          0x04
+/** Status: Unregistering -- waiting for commands to finish. */
+#define UBD_STATUS_UNREGISTERING    4
 
-/** Status: Unregistiering -- waiting for commands to finish.
- *
- *  Cannot be combined with UBD_STATUS_REGISTERING or UBD_STATUS_RUNNING.
- */
-#define UBD_STATUS_UNREGISTERING    0x08
-
-/** Status: Block device opened.
- *
- *  Cannot be combined with UBD_STATUS_REGISTERING.
- */
-#define UBD_STATUS_OPENED           0x10
-
-/** Indicates that the device is in a transitory state. */
-#define UBD_STATUS_TRANSIENT \
-    (UBD_STATUS_REGISTERING | UBD_STATUS_ADDING | UBD_STATUS_UNREGISTERING)
+/** Status: Terminated -- waiting for control endpoints to untie. */
+#define UBD_STATUS_TERMINATED       5
 
 /** Structure connecting a control (character device) endpoint to a block
  *  endpoint.
@@ -65,6 +42,9 @@ struct ublkdev {
     /** List structure for putting this in a linked list. */
     struct list_head list;
     
+    /** Request queue from the block subsystem. */
+    struct request_queue *in_flight;
+
     /** Disk structure for this block device.
      *
      *  If NULL, a block device has not yet been registered.
@@ -74,9 +54,23 @@ struct ublkdev {
     /** Work structure for scheduling add_disk() asynchronously. */
     struct work_struct add_disk_work;
 
-    /** A list of requests waiting to be delivered.
+    /** List of requests waiting to be delivered to the handler. 
+     *
+     *  We use @c request->special as a pointer to the next request in
+     *  the list rather than use Linux's @c list_head so we don't have
+     *  to allocate/deallocate another structure to wrap requests.
+     *  @par
+     *  @c wait.lock must be held to read or modify this.
      */
-    struct request_queue *pending_delivery;
+    struct request *pending_delivery_head;
+
+    /** Last request in the list of requests waiting to be delivered.
+     *
+     *  This allows us to append a request in O(1) time.
+     *  @par
+     *  @c wait.lock must be held to read or modify this.
+     */
+    struct request *pending_delivery_tail;
 
     /** An array of requests waiting for replies.
      *
@@ -92,15 +86,46 @@ struct ublkdev {
 
     /** Status of this device.
      *
-     *  @c status_wait.lock must be held to read or write this.
+     *  @c wait.lock must be held to read or write this.
      */
     uint32_t status;
 
-    /** Wait queue for notifying anyone waiting on a status change. */
-    wait_queue_head_t status_wait;
+    /** Wait queue for notifying anyone waiting on a change. */
+    wait_queue_head_t wait;
 
     /** Flags passed when registering. */
     uint32_t flags;
+
+    /** Number of control enpoints tied to this device. */
+    uint32_t n_control_handles;
+
+    /** Number of block filehandles open. */
+    uint32_t n_block_handles;
 };
+
+/** Emit a debug message. */
+#define ubd_debug(fmt, ...)                                             \
+    printk(KERN_DEBUG "[%d] %s %s:%d " fmt "\n", current->pid,          \
+           __FUNCTION__, __FILE__, __LINE__, ## __VA_ARGS__)
+
+/** Emit an info message. */
+#define ubd_info(fmt, ...)                                              \
+    printk(KERN_INFO "[%d] %s %s:%d " fmt "\n", current->pid,           \
+           __FUNCTION__, __FILE__, __LINE__, ## __VA_ARGS__)
+
+/** Emit a notice message. */
+#define ubd_notice(fmt, ...)                                            \
+    printk(KERN_NOTICE "[%d] %s %s:%d " fmt "\n", current->pid,         \
+           __FUNCTION__, __FILE__, __LINE__, ## __VA_ARGS__)
+
+/** Emit a warning message. */
+#define ubd_warning(fmt, ...)                                           \
+    printk(KERN_WARNING "[%d] %s %s:%d " fmt "\n", current->pid,        \
+           __FUNCTION__, __FILE__, __LINE__, ## __VA_ARGS__)
+
+/** Emit an error message. */
+#define ubd_err(fmt, ...)                                               \
+    printk(KERN_ERR "[%d] %s %s:%d " fmt "\n", current->pid,            \
+           __FUNCTION__, __FILE__, __LINE__, ## __VA_ARGS__)
 
 #endif /* UBLKDEV_PRIVATE_H */
