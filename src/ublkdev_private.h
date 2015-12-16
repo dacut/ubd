@@ -35,11 +35,10 @@ extern struct mutex ubd_devices_lock;
 /** Status: Running. */
 #define UBD_STATUS_RUNNING          3
 
-/** Status: Unregistering -- waiting for commands to finish. */
-#define UBD_STATUS_UNREGISTERING    4
-
-/** Status: Terminated -- waiting for control endpoints to untie. */
-#define UBD_STATUS_TERMINATED       5
+/** Status: Terminated; might still have control or block endpoints
+ *  connected.
+ */
+#define UBD_STATUS_TERMINATED       4
 
 /** Structure connecting a control (character device) endpoint to a block
  *  endpoint.
@@ -59,6 +58,9 @@ struct ublkdev {
 
     /** Work structure for scheduling add_disk() asynchronously. */
     struct work_struct add_disk_work;
+
+    /** Request queue of all in-flight requests. */
+    struct request_queue *in_flight;
 
     /** List of requests waiting to be delivered to the handler. 
      *

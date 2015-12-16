@@ -76,7 +76,7 @@ static inline uint32_t ubd_get_status(struct ublkdev *dev) {
     return status;
 }
 
-/** Helper for retreiving a block device given its major number.
+/** Retreive a block device given its major number.
  *
  *  @c ubd_devices_lock must be held while invoking this function.
  *
@@ -97,6 +97,23 @@ static ublkdev *ubd_find_device_by_major(uint32_t major) {
     }
 
     return NULL;
+}
+
+/** Free a block device.
+ *
+ *  The device must be terminated.  No locks may be held.
+ *
+ *  @param  dev     The device to free.
+ */
+static void ubd_free_ublkdev(struct ublkdev *dev) {
+    BUG_ON(dev == NULL);
+    BUG_ON(ACCESS_ONCE(dev->status) != UBD_STATUS_TERMINATED);
+    
+    blk_cleanup_queue(dev->in_flight);
+    kfree(dev->pending_reply);
+    kfree(dev);
+
+    return;
 }
 
 /* ***** Control endpoint functions ***** */
@@ -266,6 +283,30 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
 }
 
 static int ubdctl_release(struct inode *inode, struct file *filp) {
+    struct ublkdev *dev = filp_private_data;
+    unsigned long lock_flags;
+    uint32_t n_control_handles;
+
+    if (dev != NULL) {
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+
+        // Decrement the control handle count and possibly free up the
+        // structure.
+        n_control_handles = ACCESS_ONCE(dev->n_control_handles) - 1;
+        ACCESS_ONCE(dev->n_control_handles) = n_control_handles;
+
+        if (n_control_handles == 0 &&
+            ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED &&
+            ACCESS_ONCE(dev->n_block_handles) == 0)
+        {
+            // Nothing else can acquire this device.
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+            ubd_free_ublkdev(dev);
+        } else {
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        }
+    }
+    
     return 0;
 }
 
@@ -293,7 +334,6 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
         uint32_t status;
 
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
-        smp_rmb();
         status = ACCESS_ONCE(dev->status);
 
         poll_wait(filp, &dev->status_wait, wait);
@@ -304,7 +344,7 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
             if (dev->pending_delivery_head != NULL) {
                 result |= POLLIN | POLLRDNORM;
             }
-        } else if (status == UBD_STATUS_UNREGISTERING) {
+        } else if (status == UBD_STATUS_TERMINATED) {
             /* Device is being torn down. */
             result |= POLLHUP;
         }
@@ -397,6 +437,7 @@ static long ubdctl_ioctl_register(
     if (dev == NULL) {
         ubd_err("Failed to allocate %zu bytes for struct ublkdev.",
                 sizeof(*dev));
+        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
 
@@ -406,16 +447,20 @@ static long ubdctl_ioctl_register(
         ubd_err("Failed to allocate %zu bytes for reply array.",
                 UBD_INITIAL_PENDING_REPLY_SIZE);
         kfree(dev);
+        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
     dev->max_pending_reply = UBD_INITIAL_PENDING_REPLY_CAPACITY;
     dev->n_pending_reply = 0u;
+    memset(dev->pending_reply, 0, UBD_INITIAL_PENDING_REPLY_SIZE);
 
     /* Allocate and initialize the request queue. */
     if ((dev->in_flight = blk_init_queue(ubdblk_handle_request, NULL)) == NULL)
     {
         ubd_err("Failed to allocate block request queue.");
+        kfree(dev->pending_reply);
         kfree(dev);
+        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
     
@@ -425,11 +470,13 @@ static long ubdctl_ioctl_register(
     if ((dev->disk = disk = alloc_disk(1)) == NULL) {
         ubd_err("Failed to allocate gendisk structure.");
         blk_cleanup_queue(dev->in_flight);
+        kfree(dev->pending_reply);
         kfree(dev);
+        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
 
-    /* Initialize the rest of the structure. */
+    /* Initialize the rest of the gendisk structure. */
     disk->major = major;
     disk->first_minor = 0;
     memcpy(disk->disk_name, ubd_info.ubd_name, DISK_NAME_LEN);
@@ -440,15 +487,9 @@ static long ubdctl_ioctl_register(
     set_capacity(disk, info.ubd_nsectors);
     disk->private_data = dev;
 
-    /* Asynchronously add the disk.  Otherwise, there can be a race condition
-     * where udev attempts to read the disk before this ioctl returns.
-     */
-    INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
-    schedule_work(&dev->add_disk_work);
-
     /* No requests pending delivery. */
     dev->pending_delivery_head = dev->pending_delivery_tail = NULL;
-    
+
     /* Mark this device as registering. */
     dev->status = UBD_STATUS_REGISTERING;
 
@@ -462,15 +503,25 @@ static long ubdctl_ioctl_register(
     dev->n_control_handles = 0;
     dev->n_block_handles = 0;
 
+    /* Flush everything before the work function might start. */
+    smp_wmb();
+
+    /* Asynchronously add the disk.  Otherwise, there can be a race condition
+     * where udev attempts to read the disk before this ioctl returns.
+     */
+    INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
+    schedule_work(&dev->add_disk_work);
+
+    smp_wmb();
+
     /* Add this device to the global list of devices. */
     mutex_lock(&ubd_devices_lock);
     list_add_tail(& dev->list, &ubd_devices);
-    smp_wmb();
     mutex_unlock(&ubd_devices_lock);
 
     /* Copy the major number back to user space. */
     info.ubd_major = major;
-    copy_to_user((void *) data, &info, sizeof(info)) {
+    if (copy_to_user((void *) data, &info, sizeof(info))) {
         ubd_err("Userspace structure became invalid.");
         return -EFAULT;
     }
@@ -487,6 +538,7 @@ static long ubdctl_ioctl_unregister(
     struct ubdblk *dev;
     unsigned long lock_flags;
     struct request *req;
+    uint32_t n_control_handles;
     bool unfinished;
 
     mutex_lock(&ubd_devices_lock);
@@ -499,7 +551,6 @@ static long ubdctl_ioctl_unregister(
     }
 
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
-    smp_rmb();
     status = ACCESS_ONCE(dev->status);
 
     if (status == UBD_STATUS_REGISTERING) {
@@ -514,55 +565,44 @@ static long ubdctl_ioctl_unregister(
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         mutex_unlock(&ubd_devices_lock);
         return -EBUSY;
-    } else if (status == UBD_STATUS_UNREGISTERING) {
-        ubd_info("Cannot unregister device major %d; already unregistering.",
-                 major);
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-        mutex_unlock(&ubd_devices_lock);
-        return -EBUSY;
     } else if (status == UBD_STATUS_TERMINATED) {
         ubd_info("Cannot unregister device major %d; already terminated.",
                  major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         mutex_unlock(&ubd_devices_lock);
-        return -EBUSY;
+        return -EINVAL;
     }
     
     /* Start the unregister process. */
-    WRITE_ONCE(dev->status, UBD_STATUS_UNREGISTERING);
-    smp_wmb();
+    ACCESS_ONCE(dev->status) = UBD_STATUS_TERMINATED;
+
+    /* Remove this device from the list of devices. */
+    list_del(&dev->list);
+    mutex_unlock(&ubd_devices_lock);
 
     /* Increase the control handle count while unregistering so we don't
      * release the structure while we're still in this routine.
      */
-    WRITE_ONCE(dev->n_control_handles, READ_ONCE(dev->n_control_handles) + 1);
-    smp_wmb();
+    ACCESS_ONCE(dev->n_control_handles) =
+        ACCESS_ONCE(dev->n_control_handles) + 1;
 
     /* Don't deliver any messages pending delivery. */
-    while (dev->pending_delivery_head != NULL) {
+    while ((req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL) {
         /* Pop the top of the pending_delivery list.  The special field
          * is used to point to the next request.
          */
         struct request *next_request;
         
-        smp_rmb();
-        req = READ_ONCE(dev->pending_delivery_head);
-        next_request = (struct request *) READ_ONCE(req->special);
-
-        WRITE_ONCE(dev->pending_delivery_head, next_request);
+        next_request = (struct request *) ACCESS_ONCE(req->special);
+        ACCESS_ONCE(dev->pending_delivery_head) = next_request;
 
         if (next_request == NULL) {
             /* Removed the last item; axe the tail. */
-            WRITE_ONCE(dev->pending_delivery_tail, NULL);
+            ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
         }
 
-        smp_wmb();
-
-        /* We can't have device or device list locks held while holding the
-         * queue lock.
-         */
+        /* We can't have device lock held while holding the queue lock. */
         spin_lock_irqrestore(&dev->wait.lock, lock_flags);
-        mutex_unlock(&ubd_devices_lock);
 
         /* Fail this request.  This requires the queue lock to be held. */
         spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
@@ -571,27 +611,22 @@ static long ubdctl_ioctl_unregister(
 
         BUG_ON(unfinished);
 
-        /* Reacquire the device and device list lcoks. */
-        mutex_lock(&ubd_devices_lock);
+        /* Reacquire the device lock. */
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
     }
 
     /* Fail any messages awaiting a reply. */
     for (size_t i = 0; i < dev->max_pending_reply; ++i) {
-        req = dev->pending_reply[i];
-
-        if (req != NULL) {
-            uint32_t n_pending_reply;
-
-            n_pending_reply = READ_ONCE(dev->n_pending_reply);
+        if ((req = ACCESS_ONCE(dev->pending_reply[i])) != NULL) {
+            uint32_t n_pending_reply = ACCESS_ONCE(dev->n_pending_reply);
             BUG_ON(n_pending_reply == 0);
 
             --n_pending_reply;
-            WRITE_ONCE(dev->n_pending_reply, n_pending_reply);
-            dev->pending_reply[i] = NULL;
-            smp_wmb();
-                
-            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+            ACCESS_ONCE(dev->n_pending_reply) = n_pending_reply;
+            ACCESS_ONCE(dev->pending_reply[i]) = NULL;
+            
+            /* We can't have device lock held while holding the queue lock. */
+            spin_lock_irqrestore(&dev->wait.lock, lock_flags);
 
             /* Fail this request.  This requires the queue lock to be held. */
             spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
@@ -600,12 +635,25 @@ static long ubdctl_ioctl_unregister(
                 
             BUG_ON(unfinished);
 
+            /* Reacquire the device lock. */
             spin_lock_irqsave(&dev->wait.lock, lock_flags);
         }
     }
 
-    /* Allow the unmount to proceed asynchronously. */
-    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    /* Decrement the control handle count we held earlier. */
+    n_control_handles = ACCESS_ONCE(dev->n_control_handles);
+    --n_control_handles;
+    ACCESS_ONCE(dev->n_control_handles, n_control_handles);
+
+    if (n_control_handles == 0 && ACCESS_ONCE(dev->n_block_handles) == 0) {
+        // Nothing else can acquire this device.
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        ubd_free_ublkdev(dev);        
+    } else {
+        /* Allow the unmount to proceed asynchronously. */
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    }
+    
     return 0;
 }
 
@@ -626,64 +674,60 @@ static long ubdctl_ioctl_getcount(
     return count;
 }
 
-    case UBD_IOCDESCRIBE: {
-        struct ubd_describe desc;
-        struct list_head *iter;
-        size_t index = 0;
+static long ubdctl_ioctl_describe(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    struct ubd_describe desc;
+    struct list_head *iter;
+    unsigned long lock_flags;
+    uint32_t i = 0, index;
 
-        printk(KERN_DEBUG "[%d] ubdctl_ioctl: UBD_IOCDESCRIBE\n",
-               current->pid);
+    /* Get the describe structure from userspace. */
+    if (copy_from_user(&desc, (void *) data, sizeof(desc)) != 0) {
+        ubd_info("Invalid userspace address %p.", (void *) data);
+        return -EFAULT;
+    }
 
-        /* Get the describe structure from userspace. */
-        if (copy_from_user(&desc, (void *) data, sizeof(desc)) != 0) {
-            printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace address\n",
-                current->pid);
+    index = desc.ubd_index;
+
+    mutex_lock(&ubd_devices_lock);
+    list_for_each(iter, &ubd_devices) {
+        struct ublkdev *dev;
+
+        // Skip over devices until we find the one we're interested in.
+        if (i != desc.ubd_index) {
+            ++i;
+            continue;
+        }
+
+        // Found it.
+        dev = container_of(iter, struct ublkdev, list);
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        BUG_ON(dev->disk == NULL);
+
+        // Copy the data out of the device structure.
+        memcpy(desc.ubd_info.ubd_name, dev->disk->disk_name, DISK_NAME_LEN);
+        desc.ubd_info.ubd_flags = dev->flags;
+        desc.ubd_info.ubd_nsectors = get_capacity(dev->disk);
+        desc.ubd_info.ubd_major = dev->disk->major;
+        desc.ubd_info.ubd_minor = dev->disk->first_minor;
+        
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        mutex_unlock(&ubd_devices_lock);
+        
+        if (copy_to_user((void *) data, &desc, sizeof(desc)) != 0) {
+            ubd_info("Invalid userspace address %p.", (void *) data);
             return -EFAULT;
         }
 
-        mutex_lock(&ubd_devices_lock);
-        list_for_each(iter, &ubd_devices) {
-            struct ublkdev *dev;
-
-            if (index != desc.ubd_index) {
-                ++index;
-                continue;
-            }
-
-            /* Found it; return this. */
-            dev = container_of(iter, struct ublkdev, list);
-            mutex_unlock(&ubd_devices_lock);
-
-            if (dev->disk == NULL) {
-                /* Already deallocated? */
-                return -EAGAIN;
-            }
-
-            memcpy(desc.ubd_info.ubd_name, dev->disk->disk_name,
-                   DISK_NAME_LEN);
-            desc.ubd_info.ubd_flags = dev->flags;
-            desc.ubd_info.ubd_nsectors = get_capacity(dev->disk);
-            desc.ubd_info.ubd_major = dev->disk->major;
-            desc.ubd_info.ubd_minor = dev->disk->first_minor;
-
-            if (copy_to_user((void *) data, &desc, sizeof(desc)) != 0) {
-                printk(KERN_DEBUG "[%d] ubdctl_ioctl: invalid userspace "
-                       "address\n", current->pid);
-                return -EFAULT;
-            }
-
-            return 0;
-        }
-        mutex_lock(&ubd_devices_lock);
-        return -EINVAL;
+        return 0;
     }
 
-    default:
-        printk(KERN_INFO "[%d] ubdctl_ioctl: unknown ioctl 0x%x\n",
-               current->pid, cmd);
-        return -EINVAL;
-    }
-
+    // No such index.
+    mutex_lock(&ubd_devices_lock);
+    ubd_info("Index %u beyond end of device list.", index);
     return -EINVAL;
 }
 
