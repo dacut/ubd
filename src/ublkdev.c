@@ -885,8 +885,7 @@ static long ubdctl_ioctl_getrequest(
             // Attempt to copy the bytes over.
             msg.ubd_size = bio_cur_bytes(bio);
             if ((n_uncopied = copy_to_user(
-                     ((char *) data) + offsetof(struct ubd_message, ubd_data),
-                     bio_data(bio), msg.ubd_size)) != 0)
+                     msg.ubd_data, bio_data(bio), msg.ubd_size)) != 0)
             {
                 ubd_warning("Failed to copy %d bytes of %u total bytes to "
                             "userspace.", n_uncopied, msg.ubd_size);
@@ -1023,7 +1022,6 @@ static long ubdctl_ioctl_putreply(
         uint32_t n_sectors = bio_sectors(bio);
         char *buffer;
         unsigned long copy_result;
-        long reply_data;
 
         BUG_ON(bio_segments(bio) != 1);
         
@@ -1047,8 +1045,7 @@ static long ubdctl_ioctl_putreply(
 
             // Ok, copy the data back.
             buffer = bvec_kmap_irq(ubd_bvptr(bvec), &lock_flags);
-            reply_data = data + offsetof(struct ubd_message, ubd_data);
-            copy_result = copy_from_user(buffer, (void *) reply_data, size);
+            copy_result = copy_from_user(buffer, msg.ubd_data, size);
             bvec_kunmap_irq(buffer, &lock_flags);
 
             if (copy_result != 0) {

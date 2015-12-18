@@ -133,7 +133,7 @@ struct ubd_message {
     uint32_t ubd_size;
 
     /** Data for this request. */
-    char ubd_data[0];
+    void *ubd_data;
 };
 
 #endif /* UBLKDEV_H */
