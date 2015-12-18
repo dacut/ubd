@@ -5,8 +5,12 @@
 #ifndef UBLKDEV_H
 #define UBLKDEV_H
 
-#include <linux/genhd.h>
+#ifndef __KERNEL__
+#include <inttypes.h>
+#include <sys/types.h>
+#else
 #include <linux/types.h>
+#endif
 
 /** ubd ioctl magic number -- seems unused */
 #define UBD_IOC_MAGIC           0xbf
@@ -38,10 +42,12 @@
 /** ubd_flags: device is a removable disk. */
 #define UBD_FL_REMOVABLE    0x00000002
 
+#define UBD_DISK_NAME_LEN   32
+
 /** Information about a userspace block device. */
 struct ubd_info {
     /** Device name */
-    char ubd_name[DISK_NAME_LEN];
+    char ubd_name[UBD_DISK_NAME_LEN];
 
     /** Device flags */
     uint32_t ubd_flags;

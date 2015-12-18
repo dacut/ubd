@@ -13,7 +13,6 @@
 #include <linux/types.h>
 
 #include "ublkdev_private.h"
-#include "ublkdev_kernel.h"
 
 MODULE_AUTHOR("dacut@kanga.org");
 MODULE_DESCRIPTION("Userspace block devices");
@@ -46,7 +45,7 @@ static void ubd_teardown(void);
 
 /* The rq_for_each_segment macro changed incompatibly between Linux 3.13 and
    3.14.  This takes care of the differences. */
-#if KERNEL_VERSION < 0x030e
+#if KERNEL_VERSION < 3 || (KERNEL_VERSION == 3 && KERNEL_PATCHLEVEL < 14)
 typedef struct bio_vec *ubd_bvec_iter_t;
 #define ubd_bvptr(bvec) (bvec)
 #define ubd_first_sector(iter) ((iter).bio->bi_sector)
@@ -57,7 +56,7 @@ typedef struct bio_vec ubd_bvec_iter_t;
 #endif
 
 /* blk_queue_init_tags added an argument with Linux 4.0. */
-#if KERNEL_VERSION >= 0x0400
+#if KERNEL_VERSION >= 4
 #define ubd_blk_queue_init_tags(queue, depth, tags)                     \
     blk_queue_init_tags((queue), (depth), (tags), BLK_TAG_ALLOC_FIFO)
 #else

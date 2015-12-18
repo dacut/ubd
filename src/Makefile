@@ -1,6 +1,8 @@
 ifneq ($(KERNELRELEASE),)
-KBUILD_CFLAGS += -fno-inline
+KBUILD_CFLAGS += -fno-inline -DKERNEL_VERSION=$(VERSION) \
+-DKERNEL_PATCHLEVEL=$(PATCHLEVEL)
 obj-m := ublkdev.o
+
 else
 # Get the kernel version and create a preprocessor macro for it.  This allows
 # us to target multiple Linux kernel versions.
@@ -9,7 +11,6 @@ PWD := $(shell pwd)
 KERNEL_VERSION= $(shell printf "0x%02x%02x" $(shell uname -r | sed -e 's/\..*//') $(shell uname -r | sed -e 's/^[^\.]*\.\([^\.]*\)\..*/\1/'))
 
 default:
-	echo "#define KERNEL_VERSION $(KERNEL_VERSION)" > ublkdev_kernel.h
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 endif
 
