@@ -31,6 +31,12 @@ class UBDDescribe(ctypes.Structure):
         ("ubd_info", UBDInfo),
     ]
 
+class UBDTie(ctypes.Structure):
+    _fields_ = [
+        ("ubd_major", ctypes.c_uint32),
+        ("ubd_name", ctypes.c_char * DISK_NAME_LEN)
+    ]
+
 UBD_MSGTYPE_READ_REQUEST = 0
 UBD_MSGTYPE_WRITE_REQUEST = 1
 UBD_MSGTYPE_DISCARD_REQUEST = 2
