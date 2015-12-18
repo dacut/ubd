@@ -56,7 +56,6 @@ UBD_IOCTIE = _IOW(UBD_IOC_MAGIC, 0xa4, ctypes.sizeof(ctypes.c_int))
 UBD_IOCGETREQUEST = _IOWR(UBD_IOC_MAGIC, 0xa5, ctypes.sizeof(UBDMessage))
 UBD_IOCPUTREPLY = _IOW(UBD_IOC_MAGIC, 0xa6, ctypes.sizeof(UBDMessage))
 
-print(hex(UBD_IOCREGISTER))
 assert UBD_IOCREGISTER == 0xc030bfa0
 assert UBD_IOCUNREGISTER == 0x4004bfa1
 assert UBD_IOCGETCOUNT == 0x8004bfa2
