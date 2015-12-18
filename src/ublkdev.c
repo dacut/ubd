@@ -798,7 +798,7 @@ static long ubdctl_ioctl_tie(
         if (dev == NULL) {
             mutex_unlock(&ubd_devices_lock);
             ubd_warning("Unknown device major %lu.", data);
-            return -EINVAL;
+            return -ENODEV;
         }
         
         // Increment the control handle count on this device.
@@ -810,6 +810,118 @@ static long ubdctl_ioctl_tie(
         mutex_unlock(&ubd_devices_lock);
 
         filp->private_data = dev;
+    }
+
+    return 0;
+}
+
+
+/** Send a request from the block endpoint to the control endpoint. */
+static long ubdctl_ioctl_getrequest(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    struct ublkdev *dev;
+    unsigned long lock_flags;
+    struct request *req;
+    ubd_bvec_iter_t bvec;
+    struct req_iterator iter;
+    struct request *next_req;
+    struct ubd_message msg;
+    uint32_t max_pending_reply;
+    uint32_t tag;
+
+    if ((dev = filp->private_data) == NULL) {
+        ubd_warning("Control endpoint is not tied to a device.");
+        return -ENODEV;
+    }
+    
+    if (! access_ok(VERIFY_WRITE, (void *) data, sizeof(struct ubd_message))) {
+        ubd_warning("Invalid userspace address %p.", (void *) data);
+        return -EFAULT;
+    }
+
+    // Get the ubd_size data and verify the userspace address is at least
+    // somewhat valid.
+    if (copy_from_user(&msg, (void *) data, sizeof(msg))) {
+        ubd_warning("Invalid userspace address %p.", (void *) data);
+        return -EFAULT;
+    }
+
+    // Wait for a message to become available *and* a tag slot to become
+    // available.
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    if (wait_event_interruptible_locked(
+            dev->wait,
+            (req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL &&
+            ACCESS_ONCE(dev->n_pending_reply) <
+            ACCESS_ONCE(dev->max_pending_reply)))
+    {
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -ERESTARTSYS;
+    }
+
+    // Attempt to deliver this request.
+    rq_for_each_segment(bvec, req, iter) {
+        struct bio *bio = iter.bio;
+        uint32_t n_sectors = bio_sectors(bio);
+
+        BUG_ON(bio_segments(bio) != 1);
+
+        msg.ubd_nsectors = n_sectors;
+        msg.ubd_first_sector = ubd_first_sector(iter);
+
+        if (bio_data_dir(bio) == READ) {
+            msg.ubd_msgtype = UBD_MSGTYPE_READ;
+            msg.ubd_size = 0;
+        } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
+            msg.ubd_msgtype = UBD_MSGTYPE_DISCARD;
+            msg.ubd_size = 0;
+        } else {
+            int n_uncopied;
+
+            msg.ubd_msgtype = UBD_MSGTYPE_WRITE;
+            // Attempt to copy the bytes over.
+            msg.ubd_size = bio_cur_bytes(bio);
+            if ((n_uncopied = copy_to_user(
+                     ((char *) data) + offsetof(struct ubd_message, ubd_data),
+                     bio_data(bio), msg.ubd_size)) != 0)
+            {
+                ubd_warning("Failed to copy %d bytes of %u total bytes to "
+                            "userspace.", n_uncopied, msg.ubd_size);
+                spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+                
+                // Indicate the size of the data buffer needed.
+                return msg.ubd_size;
+            }
+        }
+    }
+
+    // Allocate a tag for this request.
+    max_pending_reply = ACCESS_ONCE(dev->max_pending_reply);
+    for (tag = 0u; tag < max_pending_reply; ++tag) {
+        if (ACCESS_ONCE(dev->pending_reply[tag]) == NULL) {
+            break;
+        }
+    }
+
+    BUG_ON(tag == max_pending_reply);
+    msg.ubd_tag = tag;
+    
+    // Copy the message back to userspace.  If this is a write request, the
+    // data has already been copied over.
+    if (copy_to_user((void *) data, &msg, sizeof(msg)) != 0) {
+        // Userspace became invalid?!
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -EFAULT;
+    }
+
+    // Dequeue this request.
+    next_req = (struct request *) req->special;
+    ACCESS_ONCE(dev->pending_delivery_head) = next_req;
+    if (next_req == NULL) {
+        ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
     }
 
     return 0;
