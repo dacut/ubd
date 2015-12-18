@@ -69,9 +69,6 @@ struct ubd_tie {
     char ubd_name[DISK_NAME_LEN];
 };
 
-/** ubd_msgtype code for replies. */
-#define UBD_MSGTYPE_REPLY                   0x80000000
-
 /** ubd_msgtype code for a read request/reply. */
 #define UBD_MSGTYPE_READ                    0
 
@@ -81,8 +78,8 @@ struct ubd_tie {
 /** ubd_msgtype code for a discard (trim) request. */
 #define UBD_MSGTYPE_DISCARD                 2
 
-/** Maximum size of a UBD message */
-#define UBD_MAX_MESSAGE_SIZE                ((size_t) (4 << 20))   /* 4 MB */
+/** Maximum size of UBD data in a request or reply. */
+#define UBD_MAX_DATA_SIZE             	    ((size_t) (4 << 20))   /* 4 MB */
 
 /** UBD request / reply
  *  
@@ -97,7 +94,7 @@ struct ubd_message {
      *  @li @c UBD_IOCPUTREPLY [IN]
      */
     uint32_t ubd_msgtype;
-    
+
     /** Tag to match up requests with replies.
      *
      *  @li @c UBD_IOCGETREQUEST [OUT]
@@ -105,12 +102,25 @@ struct ubd_message {
      */
     uint32_t ubd_tag;
 
-    /** Number of 512-byte sectors to read.
-     *
-     *  @li @c UBD_IOCGETREQUEST [OUT]
-     *  @li @c UBD_IOCPUTREPLY Unused
-     */
-    uint32_t ubd_nsectors;
+    union {
+        /** Number of 512-byte sectors to read.
+         *
+         *  @li @c UBD_IOCGETREQUEST [OUT]
+         *  @li @c UBD_IOCPUTREPLY Unused
+         */
+        uint32_t ubd_nsectors;
+
+        /** Status of a reply.
+         *
+         *  If non-negative, this indicates the number of bytes read, written,
+         *  or trimmed.  If negative, this indicates the error that resulted
+         *  from the operation.
+         *
+         *  @li @c UBD_IOCGETREQUEST Unused
+         *  @li @c UBD_IOCPUTREPLY [IN]
+         */
+        int32_t ubd_status;
+    };
     
     /** First sector of the request.
      *
@@ -126,8 +136,9 @@ struct ubd_message {
      *      of valid bytes in @c ubd_data (zero for read and trim requests;
      *      non-zero for write requests).
      *  @li @c UBD_IOCPUTREPLY [IN] The number of valid bytes in @c ubd_data.
-     *      This is valid only for write replies.
+     *      This is valid only for read replies.
      */
+    uint32_t ubd_size;
 
     /** Data for this request. */
     char ubd_data[0];

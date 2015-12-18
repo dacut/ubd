@@ -65,17 +65,6 @@ typedef struct bio_vec ubd_bvec_iter_t;
     blk_queue_init_tags((queue), (depth), (tags))
 #endif
 
-/** Helper for retrieving the status. */
-static inline uint32_t ubd_get_status(struct ublkdev *dev) {
-    uint32_t status;
-    
-    mutex_lock(&dev->status_lock);
-    status = ACCESS_ONCE(dev->status);
-    mutex_unlock(&dev->status_lock);
-
-    return status;
-}
-
 /** Retreive a block device given its major number.
  *
  *  @c ubd_devices_lock must be held while invoking this function.
@@ -84,13 +73,13 @@ static inline uint32_t ubd_get_status(struct ublkdev *dev) {
  *  @return The @c ublkdev object corresponding to the major number, or
  *          @c NULL if a corresponding device does not exist.
  */
-static ublkdev *ubd_find_device_by_major(uint32_t major) {
+static struct ublkdev *ubd_find_device_by_major(uint32_t major) {
     struct list_head *el;
     
     BUG_ON(! mutex_is_locked(&ubd_devices_lock));
 
     list_for_each(el, &ubd_devices) {
-        ublkdev *dev = list_entry(el, struct ublkdev *, list);
+        struct ublkdev *dev = list_entry(el, struct ublkdev, list);
         if (dev->disk != NULL && dev->disk->major == major) {
             return dev;
         }
@@ -136,19 +125,54 @@ static ssize_t ubdctl_write(struct file *filp, const char *buffer, size_t size,
 static unsigned int ubdctl_poll(struct file *filp, poll_table *wait);
 
 /** Handler for ioctl() on the control endpoint. */
-static long ubdctl_ioctl(struct file *filp, unsigned int cmd,
-                         unsigned long data);
+static long ubdctl_ioctl(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Register a new userspace block device. */
+static long ubdctl_ioctl_register(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Unregister a userspace block device. */
+static long ubdctl_ioctl_unregister(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Get the count of userspace block devices. */
+static long ubdctl_ioctl_getcount(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Get a description of a userspace block device. */
+static long ubdctl_ioctl_describe(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Tie this control endpoint to the request stream of a particular
+ *  userspace block device.
+ */
+static long ubdctl_ioctl_tie(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Send a request from the block endpoint to the control endpoint. */
+static long ubdctl_ioctl_getrequest(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
 
 /** Handle a reply from the control endpoint back to the block endpoint. */
-static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *message);
-
-/** Register a disk with the control endpoint. */
-static int ubdctl_register(struct ublkdev *dev, struct ubd_info *info);
-
-/** Unregister a disk from the control endpoint.
- *  dev->status_lock MUST be held while calling this function.
- */
-static int ubdctl_unregister(struct ublkdev *dev);
+static long ubdctl_ioctl_putreply(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
 
 /** Control endpoint file operations. */
 static struct file_operations ubdctl_fops = {
@@ -283,7 +307,7 @@ static int ubdctl_open(struct inode *inode, struct file *filp) {
 }
 
 static int ubdctl_release(struct inode *inode, struct file *filp) {
-    struct ublkdev *dev = filp_private_data;
+    struct ublkdev *dev = filp->private_data;
     unsigned long lock_flags;
     uint32_t n_control_handles;
 
@@ -336,7 +360,7 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         status = ACCESS_ONCE(dev->status);
 
-        poll_wait(filp, &dev->status_wait, wait);
+        poll_wait(filp, &dev->wait, wait);
 
         if (status == UBD_STATUS_RUNNING) {
             result |= POLLOUT | POLLWRNORM;
@@ -403,13 +427,14 @@ static long ubdctl_ioctl_register(
     struct ubd_info info;
     size_t name_length;
     int major;
+    struct ublkdev *dev;
     struct gendisk *disk;
 
     ubd_debug("Copying structures from userspace.");
 
     /* Get the disk info from userspace. */
     if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
-        ubd_notice("Invalid userspace address.");
+        ubd_notice("Invalid userspace address %p.", (void *) data);
         return -EFAULT;
     }
     
@@ -442,7 +467,8 @@ static long ubdctl_ioctl_register(
     }
 
     /* Allocate and initialize the reply array. */
-    if ((dev->pending_reply = kmalloc(UBD_INITIAL_PENDING_REPLY_SIZE)) == NULL)
+    if ((dev->pending_reply = kmalloc(
+             UBD_INITIAL_PENDING_REPLY_SIZE, GFP_NOIO)) == NULL)
     {
         ubd_err("Failed to allocate %zu bytes for reply array.",
                 UBD_INITIAL_PENDING_REPLY_SIZE);
@@ -479,7 +505,7 @@ static long ubdctl_ioctl_register(
     /* Initialize the rest of the gendisk structure. */
     disk->major = major;
     disk->first_minor = 0;
-    memcpy(disk->disk_name, ubd_info.ubd_name, DISK_NAME_LEN);
+    memcpy(disk->disk_name, info.ubd_name, DISK_NAME_LEN);
     disk->devnode = ubdblk_get_devnode;
     disk->fops = &ubdblk_fops;
     disk->queue = dev->in_flight;
@@ -497,7 +523,7 @@ static long ubdctl_ioctl_register(
     init_waitqueue_head(&dev->wait);
 
     /* Copy flags over. */
-    dev->flags = info.flags;
+    dev->flags = info.ubd_flags;
 
     /* Nobody has this open or tied yet. */
     dev->n_control_handles = 0;
@@ -535,11 +561,13 @@ static long ubdctl_ioctl_unregister(
     unsigned long data)
 {
     int major = (int) data;
-    struct ubdblk *dev;
-    unsigned long lock_flags;
+    struct ublkdev *dev;
     struct request *req;
+    unsigned long lock_flags;
+    uint32_t status;
     uint32_t n_control_handles;
     bool unfinished;
+    size_t i;
 
     mutex_lock(&ubd_devices_lock);
 
@@ -555,12 +583,6 @@ static long ubdctl_ioctl_unregister(
 
     if (status == UBD_STATUS_REGISTERING) {
         ubd_info("Cannot unregister device major %d; still registering "
-                 "device.", major);
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-        mutex_unlock(&ubd_devices_lock);
-        return -EBUSY;
-    } else if (status == UBD_STATUS_ADDING) {
-        ubd_info("Cannot unregister device major %d; still adding "
                  "device.", major);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         mutex_unlock(&ubd_devices_lock);
@@ -602,12 +624,12 @@ static long ubdctl_ioctl_unregister(
         }
 
         /* We can't have device lock held while holding the queue lock. */
-        spin_lock_irqrestore(&dev->wait.lock, lock_flags);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
         /* Fail this request.  This requires the queue lock to be held. */
-        spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
+        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
         unfinished = blk_end_request_err(req, -EIO);
-        spin_lock_irqrestore(&dev->in_flight.queue_lock, lock_flags);
+        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
 
         BUG_ON(unfinished);
 
@@ -616,7 +638,7 @@ static long ubdctl_ioctl_unregister(
     }
 
     /* Fail any messages awaiting a reply. */
-    for (size_t i = 0; i < dev->max_pending_reply; ++i) {
+    for (i = 0; i < dev->max_pending_reply; ++i) {
         if ((req = ACCESS_ONCE(dev->pending_reply[i])) != NULL) {
             uint32_t n_pending_reply = ACCESS_ONCE(dev->n_pending_reply);
             BUG_ON(n_pending_reply == 0);
@@ -626,12 +648,12 @@ static long ubdctl_ioctl_unregister(
             ACCESS_ONCE(dev->pending_reply[i]) = NULL;
             
             /* We can't have device lock held while holding the queue lock. */
-            spin_lock_irqrestore(&dev->wait.lock, lock_flags);
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
             /* Fail this request.  This requires the queue lock to be held. */
-            spin_lock_irqsave(&dev->in_flight.queue_lock, lock_flags);
+            spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
             unfinished = blk_end_request_err(req, -EIO);
-            spin_lock_irqrestore(&dev->in_flight.queue_lock, lock_flags);
+            spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
                 
             BUG_ON(unfinished);
 
@@ -643,7 +665,7 @@ static long ubdctl_ioctl_unregister(
     /* Decrement the control handle count we held earlier. */
     n_control_handles = ACCESS_ONCE(dev->n_control_handles);
     --n_control_handles;
-    ACCESS_ONCE(dev->n_control_handles, n_control_handles);
+    ACCESS_ONCE(dev->n_control_handles) = n_control_handles;
 
     if (n_control_handles == 0 && ACCESS_ONCE(dev->n_block_handles) == 0) {
         // Nothing else can acquire this device.
@@ -712,7 +734,7 @@ static long ubdctl_ioctl_describe(
         desc.ubd_info.ubd_flags = dev->flags;
         desc.ubd_info.ubd_nsectors = get_capacity(dev->disk);
         desc.ubd_info.ubd_major = dev->disk->major;
-        desc.ubd_info.ubd_minor = dev->disk->first_minor;
+        // desc.ubd_info.ubd_minor = dev->disk->first_minor;
         
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         mutex_unlock(&ubd_devices_lock);
@@ -732,254 +754,162 @@ static long ubdctl_ioctl_describe(
 }
 
 
-static void ubdctl_handle_reply(struct ublkdev *dev, struct ubd_reply *reply) {
-    ubd_bvec_iter_t bvec;
-    struct req_iterator iter;
-    struct request *rq;
-    int32_t status;
-    uint32_t msgtype;
-    uint32_t size;
-    uint32_t tag;
-    int result = -EINVAL;
-    unsigned int n_bytes = 0;
-    bool unfinished;
-    int n_pending;
-
-    BUG_ON(dev == NULL);
-    BUG_ON(reply == NULL);
-
-    status = reply->ubd_status;
-    msgtype = reply->ubd_header.ubd_msgtype;
-    size = reply->ubd_header.ubd_size;
-    tag = reply->ubd_header.ubd_tag;
-
-    /* Make sure the message type and size are sensical. */
-    if (msgtype == UBD_MSGTYPE_READ_REPLY) {
-        if (size < offsetof(struct ubd_reply, ubd_data)) {
-            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid read "
-                   "reply packet with size %u (minimum is %zu)\n",
-                   current->pid, size, offsetof(struct ubd_reply, ubd_data));
-            return;
-        }
-
-        /* Make sure the size of the data is on a sector boundary. */
-        if ((size - offsetof(struct ubd_reply, ubd_data)) % 512 != 0) {
-            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid read "
-                   "reply packet with size %u (not a sector-sized reply)\n",
-                   current->pid, size);
-            return;
-        }
-    } else if (msgtype == UBD_MSGTYPE_WRITE_REPLY) {
-        if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid "
-                   "write reply packet with size %u (expected %zu)\n",
-                   current->pid, size, sizeof(struct ubd_reply));
-            return;
-        }
-    } else if (msgtype == UBD_MSGTYPE_DISCARD_REPLY) {
-        if (size != sizeof(struct ubd_reply)) {
-            printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid "
-                   "discard reply packet with size %u (expected %zu)\n",
-                   current->pid, size, sizeof(struct ubd_reply));
-            return;
-        }
-    } else {
-        printk(KERN_INFO "[%d] ubdctl_handle_reply: received invalid reply "
-               "type 0x%x\n", current->pid, msgtype);
-        return;
-    }
-
-    /* Find the request this belongs to. */
-    rq = blk_queue_find_tag(dev->blk_pending, tag);
-    if (rq == NULL) {
-        printk(KERN_INFO "[%d] ubdctl_handle_reply: received reply for "
-               "unknown tag %u\n", current->pid, tag);
-        return;
-    }
-
-    rq_for_each_segment(bvec, rq, iter) {
-        struct bio *bio = iter.bio;
-        uint32_t n_sectors = bio_sectors(bio);
-
-        BUG_ON(bio_segments(bio) != 1);
-
-        if (reply->ubd_status < 0) {
-            /* Error received */
-            result = reply->ubd_status;
-            n_bytes += n_sectors * 512;
-        } else if (reply->ubd_status != n_sectors) {
-            /* Sector count mismatch. */
-            printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u sectors; "
-                   "received %u sectors.\n", current->pid, n_sectors,
-                   reply->ubd_status);
-
-            result = -EIO;
-            n_bytes += n_sectors * 512;
-        } else if (bio_data_dir(bio) == READ) {
-            /* Read request */
-            uint32_t recv_data = reply->ubd_header.ubd_size -
-                offsetof(struct ubd_reply, ubd_data);
-
-            if (msgtype != UBD_MSGTYPE_READ_REPLY) {
-                /* Reply type doesn't match what was requested. */
-                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected read "
-                       "reply packet for tag %u.\n", current->pid, tag);
-                result = -EIO;
-            } else if (recv_data != 512 * n_sectors) {
-                /* Reply size does not match the requested size. */
-                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected %u "
-                       "bytes; received %u bytes.\n", current->pid,
-                       512 * n_sectors, recv_data);
-                result = -EIO;
-            } else {
-                /* Ok -- copy the data back. */
-                char *buffer;
-                unsigned long flags;
-
-                buffer = bvec_kmap_irq(ubd_bvptr(bvec), &flags);
-                memcpy(buffer, reply->ubd_data, recv_data);
-                bvec_kunmap_irq(buffer, &flags);
-
-                result = 0;
-                n_bytes += recv_data;
-            }
-        } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
-            if (msgtype != UBD_MSGTYPE_DISCARD_REPLY) {
-                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected discard "
-                       "reply packet for tag %u.\n", current->pid, tag);
-                result = -EIO;
-            } else {
-                result = 0;
-                n_bytes += 512 * n_sectors;
-            }
-        } else {
-            if (msgtype != UBD_MSGTYPE_WRITE_REPLY) {
-                printk(KERN_INFO "[%d] ubdctl_handle_reply: expected write "
-                       "reply packet for tag %u.\n", current->pid, tag);
-                result = -EIO;
-            } else {
-                result = 0;
-            }
-
-            n_bytes += 512 * n_sectors;
-        }
-    }
-
-    BUG_ON(result == -EINVAL);
-    unfinished = blk_end_request(rq, result, n_bytes);
-    if (unfinished) {
-        printk(KERN_ERR "[%d] ubdctl_handle_reply: blk_end_request didn't "
-               "finish; tag=%d, n_bytes=%u\n", current->pid, rq->tag, n_bytes);
-    }
-    BUG_ON(unfinished);
-
-    /* ubdblk_handle_fs_request might be waiting for a tag.  Notify it
-       that we just made one available. */
-    n_pending = atomic_dec_return(&dev->n_pending);
-    printk(KERN_DEBUG "[%d] ubdctl_handle_reply: n_pending now %d\n",
-           current->pid, n_pending);
-
-    return;
-}
-
-
-static int ubdctl_register(
+static long ubdctl_ioctl_putreply(
     struct file *filp,
     unsigned int cmd,
     unsigned long data)
 {
-    struct gendisk *disk;
-    int major;
-    int result = -EINVAL;
-    uint32_t status;
+    struct ublkdev *dev;
+    struct ubd_message msg;
+    struct request *req = NULL;
+    ubd_bvec_iter_t bvec;
+    struct req_iterator iter;
+    unsigned long lock_flags;
+    uint32_t msgtype;
+    uint32_t tag;
+    int32_t status;
+    uint32_t size;
+    long result = -EIO;
+    bool unfinished;
 
-    if (mutex_lock_interruptible(&dev->status_lock)) {
-        return -ERESTARTSYS;
+#define UBD_ABORT(_result) do { result = (_result); goto done; } while (0)
+#define UBD_FINISH_ERR(_err)                                            \
+    do {                                                                \
+        result = 0;                                                     \
+        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);      \
+        unfinished = blk_end_request_err(req, (_err));                  \
+        BUG_ON(unfinished);                                             \
+        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags); \
+        goto done;                                                      \
+    } while (0)
+#define UBD_FINISH(_nbytes)                                             \
+    do {                                                                \
+        result = 0;                                                     \
+        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);      \
+        unfinished = blk_end_request(req, 0, (_nbytes));                \
+        BUG_ON(unfinished);                                             \
+        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags); \
+        goto done;                                                      \
+    } while (0)
+
+    dev = filp->private_data;
+    if (dev == NULL) {
+        ubd_warning("Reply received from an untied control endpoint.");
+        UBD_ABORT(-EINVAL);
     }
-    
-    /* Make sure we haven't already registered a disk on this control
-       endpoint */
-    smp_rmb();
-    status = READ_ONCE(dev->status);
 
-    if (status != 0) {
-        printk(KERN_INFO "[%d] ubdctl_register: attempted to register "
-               "duplicate device\n", current->pid);
-        mutex_unlock(&dev->status_lock);
-        return -EBUSY;
+    if (copy_from_user(&msg, (void *) data, sizeof(msg)) != 0) {
+        ubd_warning("Invalid userspace address %p.", (void *) data);
+        UBD_ABORT(-EFAULT);
     }
 
-    BUG_ON(dev->disk != NULL);
+    msgtype = msg.ubd_msgtype;
+    tag = msg.ubd_tag;
+    status = msg.ubd_status;
+    size = msg.ubd_size;
 
-    /* Make sure the name is NUL terminated. */
-    memcpy(name, info->ubd_name, DISK_NAME_LEN);
-    name[DISK_NAME_LEN] = '\0';
+    if (size != 0) {
+        if (msgtype != UBD_MSGTYPE_READ) {
+            ubd_warning("Userspace provided data on a non-read reply.");
+            UBD_ABORT(-EINVAL);
+        }
 
-    /* Register the block device. */
-    if ((major = register_blkdev(0, name)) < 0) {
-        /* Error -- maybe in the name? */
-        printk(KERN_INFO "[%d] ubdctl_register: failed to register block "
-               "device with name \"%s\": %d\n", current->pid, name, major);
-        mutex_unlock(&dev->status_lock);
-        return major;
+        if (size > UBD_MAX_DATA_SIZE) {
+            ubd_warning("Userspace attempted to return 0x%x bytes; this is "
+                        "greater than UBD_MAX_DATA_SIZE (0x%lx).",
+                        size, UBD_MAX_DATA_SIZE);
+            UBD_ABORT(-EINVAL);
+        }
     }
 
-    info->ubd_major = (uint32_t) major;
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    // If the device isn't running, just drop this.
+    if (ACCESS_ONCE(dev->status) != UBD_STATUS_RUNNING) {
+        UBD_ABORT(-EBUSY);
+    }
 
-    /* Register the request handler */
-    dev->blk_pending = blk_init_queue(ubdblk_handle_request, NULL);
-    dev->blk_pending->queuedata = dev;
-
-    /* XXX: We only support one segment at a time for now. */
-    blk_queue_max_segments(dev->blk_pending, 1);
-    if ((result = ubd_blk_queue_init_tags(
-             dev->blk_pending, UBD_MAX_TAGS, NULL)) != 0)
+    // Get the request corresponding to this tag -- assume this tag is
+    // sensical.
+    if (tag > ACCESS_ONCE(dev->max_pending_reply) ||
+        (req = ACCESS_ONCE(dev->pending_reply[tag])) == NULL)
     {
-        printk(KERN_ERR "[%d] ubdctl_register: failed to initialize tags: "
-               "err=%d\n", current->pid, -result);
-        mutex_unlock(&dev->status_lock);
-        return result;
+        ubd_warning("Received a reply for unknown tag %u.", tag);
+        UBD_ABORT(-EBUSY);
     }
 
-    /* Allocate a disk structure. */
-    /* FIXME: Allow users to register more than 1 minor. */
-    if ((dev->disk = disk = alloc_disk(1)) == NULL) {
-        printk(KERN_ERR "[%d] ubdctl_register: failed to allocate gendisk "
-               "structure\n", current->pid);
-        mutex_unlock(&dev->status_lock);
-        return -ENOMEM;
+    // Remove this reply from the list of pending replies.
+    ACCESS_ONCE(dev->pending_reply[tag]) = NULL;
+    ACCESS_ONCE(dev->n_pending_reply) = 
+        ACCESS_ONCE(dev->n_pending_reply) - 1;
+    wake_up_locked(&dev->wait);
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
+    rq_for_each_segment(bvec, req, iter) {
+        struct bio *bio = iter.bio;
+        uint32_t n_sectors = bio_sectors(bio);
+        char *buffer;
+        unsigned long copy_result;
+        long reply_data;
+
+        BUG_ON(bio_segments(bio) != 1);
+        
+        if (bio_data_dir(bio) == READ) {
+            // Make sure we got a read reply.
+            if (msgtype != UBD_MSGTYPE_READ) {
+                ubd_warning("Received incompatible reply for tag %u.", tag);
+                UBD_FINISH_ERR(-EIO);
+            }
+
+            if (status < 0) {
+                // Error passthrough.
+                UBD_FINISH_ERR(status);
+            } else if (status != size || status != 512 * n_sectors) {
+                // Size is incorrect.
+                ubd_warning("Received incorrect read data size: expected "
+                            "%u bytes, received %u bytes, finished %d bytes.",
+                            512 * n_sectors, size, status);
+                UBD_FINISH_ERR(-EIO);
+            }
+
+            // Ok, copy the data back.
+            buffer = bvec_kmap_irq(ubd_bvptr(bvec), &lock_flags);
+            reply_data = data + offsetof(struct ubd_message, ubd_data);
+            copy_result = copy_from_user(buffer, (void *) reply_data, size);
+            bvec_kunmap_irq(buffer, &lock_flags);
+
+            if (copy_result != 0) {
+                ubd_warning("Failed to copy %lu bytes from userspace.",
+                            copy_result);
+                UBD_FINISH_ERR(-EIO);
+            } else {
+                UBD_FINISH(size);
+            }
+        } else if (
+            ((bio->bi_rw & REQ_DISCARD) != 0 &&
+             msgtype != UBD_MSGTYPE_DISCARD) ||
+            ((bio->bi_rw & REQ_DISCARD) == 0 &&
+             msgtype != UBD_MSGTYPE_WRITE))
+        {
+            ubd_warning("Received incompatible reply for tag %u.", tag);
+            UBD_FINISH_ERR(-EIO);
+        } else {
+            if (status < 0) {
+                // Error passthrough
+                UBD_FINISH_ERR(status);
+            } else if (status != 512 * n_sectors) {
+                ubd_warning("Received incorrect write/truncate data size; "
+                            "expected %u bytes, finished %d bytes.",
+                            512 * n_sectors, status);
+                UBD_FINISH_ERR(-EIO);
+            } else {
+                UBD_FINISH(status);
+            }
+        }
     }
 
-    /* Fill in the disk structure. */
-    disk->major = major;
-    disk->first_minor = 0;
-    // disk->minors = 1;
-    memcpy(disk->disk_name, name, DISK_NAME_LEN);
-    disk->devnode = ubdblk_get_devnode;
-    disk->fops = &ubdblk_fops;
-    disk->queue = dev->blk_pending;
-    disk->flags =
-        (info->ubd_flags & UBD_FL_REMOVABLE) ? GENHD_FL_REMOVABLE : 0;
-    set_capacity(disk, info->ubd_nsectors);
-    disk->private_data = dev;
-
-    /* Add the disk after this method returns. */
-    INIT_WORK(&dev->add_disk_work, ubdblk_add_disk);
-    schedule_work(&dev->add_disk_work);
-
-    /* Mark this device as registering */
-    WRITE_ONCE(dev->status, UBD_STATUS_REGISTERING);
-    dev->flags = info->ubd_flags;
-    mutex_unlock(&dev->status_lock);
-
-    /* Add this to the list of registered disks. */
-    mutex_lock(&ubd_devices_lock);
-    list_add_tail(&dev->list, &ubd_devices);
-    mutex_unlock(&ubd_devices_lock);
-
-    return 0;
+done:
+    return result;
 }
-
 
 
 static char *ubdblk_get_devnode(struct gendisk *gd, umode_t *mode) {
@@ -989,6 +919,9 @@ static char *ubdblk_get_devnode(struct gendisk *gd, umode_t *mode) {
 
 static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
     struct ublkdev *dev;
+    unsigned long lock_flags;
+    uint32_t flags;
+    uint32_t status;
 
     BUG_ON(blkdev == NULL);
     BUG_ON(blkdev->bd_disk == NULL);
@@ -996,36 +929,30 @@ static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
     dev = blkdev->bd_disk->private_data;
     BUG_ON(dev == NULL);
 
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
+
+    flags = ACCESS_ONCE(dev->flags);
+    status = ACCESS_ONCE(dev->status);
+
     /* If opened for writing, make sure this isn't read-only. */
-    if ((dev->flags & UBD_FL_READ_ONLY) != 0 &&
-        (mode & (FMODE_WRITE | FMODE_PWRITE)) != 0)
+    if (unlikely((flags & UBD_FL_READ_ONLY) != 0 &&
+                 (mode & (FMODE_WRITE | FMODE_PWRITE)) != 0))
     {
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -EACCES;
     }
 
-    if (mutex_lock_interruptible(&dev->status_lock)) {
-        return -ERESTARTSYS;
-    }
-    
-    if ((dev->status & UBD_STATUS_RUNNING) == 0) {
-        printk(KERN_ERR "[%d] ubdblk_open: device is not running\n",
-               current->pid);
-        mutex_unlock(&dev->status_lock);
+    if (unlikely(status != UBD_STATUS_RUNNING)) {
+        ubd_warning("Device is not running.");
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -EAGAIN;
     }
 
-    if ((dev->status & UBD_STATUS_OPENED) != 0) {
-        printk(KERN_ERR "[%d] ubdblk_open: device is already open\n",
-               current->pid);
-        mutex_unlock(&dev->status_lock);
-        return -EBUSY;
-    }
-    
-    dev->status |= UBD_STATUS_OPENED;
-    mutex_unlock(&dev->status_lock);
-    wake_up_interruptible(&dev->status_wait);
+    ACCESS_ONCE(dev->n_block_handles) = ACCESS_ONCE(dev->n_block_handles) + 1;
+    wake_up_locked(&dev->wait);
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
-    printk(KERN_ERR "[%d] ubdblk_open: success\n", current->pid);
+    ubd_debug("Device opened.");
 
     return 0;
 }
@@ -1033,23 +960,29 @@ static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
 
 static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
     struct ublkdev *dev;
-    uint32_t status;
+    unsigned long lock_flags;
+    uint32_t n_block_handles;
 
     BUG_ON(disk == NULL);
-
     dev = disk->private_data;
     BUG_ON(dev == NULL);
 
-    mutex_lock(&dev->status_lock);
-    status = READ_ONCE(dev->status);
-
-    BUG_ON((status & UBD_STATUS_OPENED) == 0);
-    status &= ~UBD_STATUS_OPENED;
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
     
-    WRITE_ONCE(dev->status, status);
+    n_block_handles = ACCESS_ONCE(dev->n_block_handles) - 1;
+    ACCESS_ONCE(dev->n_block_handles) = n_block_handles;
 
-    mutex_unlock(&dev->status_lock);
-    wake_up_interruptible(&dev->status_wait);    
+    if (n_block_handles == 0 &&
+        ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED &&
+        ACCESS_ONCE(dev->n_control_handles) == 0)
+    {
+        // Nothing else can acquire this device.
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        ubd_free_ublkdev(dev);
+    } else {
+        wake_up_locked(&dev->wait);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    }
 
     return;
 }
@@ -1080,32 +1013,24 @@ static int ubdblk_revalidate_disk(struct gendisk *gd) {
 
 static void ubdblk_add_disk(struct work_struct *work) {
     struct ublkdev *dev = container_of(work, struct ublkdev, add_disk_work);
+    unsigned long lock_flags;
+    uint32_t status;
 
     printk(KERN_DEBUG "[%d] ubdblk_add_disk: dev=%p\n", current->pid, dev);
     BUG_ON(dev == NULL);
 
     /* Go from registering to running+adding */
-    mutex_lock(&dev->status_lock);    
-    BUG_ON(dev->status != UBD_STATUS_REGISTERING);
-    dev->status = (UBD_STATUS_ADDING | UBD_STATUS_RUNNING);
-    mutex_unlock(&dev->status_lock);
-    wake_up_interruptible(&dev->status_wait);
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    status = ACCESS_ONCE(dev->status);
+    BUG_ON(status != UBD_STATUS_REGISTERING);
+    ACCESS_ONCE(dev->status) = UBD_STATUS_RUNNING;
+    wake_up_locked(&dev->wait);
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
     /* Add the disk to the system. */
-    printk(KERN_DEBUG "[%d] ubdblk_add_disk: calling add_disk\n",
-           current->pid);
+    ubd_debug("Calling add_disk.");
     add_disk(dev->disk);
-
-    printk(KERN_DEBUG "[%d] ubdblk_add_disk: add_disk returned\n",
-           current->pid);
-
-    /* Go from running+adding to just running */
-    mutex_lock(&dev->status_lock);
-    dev->status &= ~UBD_STATUS_ADDING;
-    mutex_unlock(&dev->status_lock);
-    wake_up_interruptible(&dev->status_wait);
-
-    printk(KERN_DEBUG "[%d] ubdblk_add_disk: done\n", current->pid);
+    ubd_debug("add_disk returned.");
 
     return;
 }
@@ -1113,26 +1038,21 @@ static void ubdblk_add_disk(struct work_struct *work) {
 
 static void ubdblk_handle_request(struct request_queue *rq) {
     struct ublkdev *dev = rq->queuedata;
-    int is_running;
     struct request *req;
+    unsigned long lock_flags;
+    uint32_t status;
+    bool unfinished;
 
     BUG_ON(dev == NULL);
 
-    /* We can't use blk_fetch_request here -- the tag API also starts the
-       request, which will result in a bugcheck. */
-    while ((req = blk_peek_request(rq)) != NULL) {
-        bool unfinished;
+    while ((req = blk_fetch_request(rq)) != NULL) {
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        status = dev->status;
 
-        // spin_unlock_irq(rq->queue_lock);
-        is_running = ((ubd_get_status(dev) & UBD_STATUS_RUNNING) != 0);
-
-        if (unlikely(! is_running)) {
-            /* Device is not running; fail the request. */
-            blk_start_request(req);
+        if (unlikely(status != UBD_STATUS_RUNNING)) {
+            // Device is not running; fail the request.
             unfinished = blk_end_request_err(req, -EIO);
             BUG_ON(unfinished);
-            printk(KERN_INFO "[%d] ublkdev_handle_request: request failed.\n",
-                   current->pid);
         } else {
             switch (req->cmd_type) {
             case REQ_TYPE_FS:
@@ -1140,110 +1060,37 @@ static void ubdblk_handle_request(struct request_queue *rq) {
                 break;
 
             default:
-                printk(KERN_DEBUG "[%d] ubdblk: unknown request type 0x%x\n",
-                       current->pid, req->cmd_type);
-                blk_start_request(req);
+                ubd_err("Unknown request type 0x%x\n", req->cmd_type);
                 unfinished = blk_end_request_err(req, -EIO);
                 BUG_ON(unfinished);
                 break;
             }
         }
-        
-        // spin_lock_irq(rq->queue_lock);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
 
     return;
 }
 
 
-static void ubdblk_handle_fs_request(struct ublkdev *dev, struct request *rq) {
-    ubd_bvec_iter_t bvec;
-    struct req_iterator iter;
-    struct ubd_outgoing_message *msg;
-    struct ubd_request *ureq;
-    int n_pending;
+static void ubdblk_handle_fs_request(
+    struct ublkdev *dev,
+    struct request *req)
+{
+    struct request *tail;
 
     BUG_ON(dev == NULL);
-    BUG_ON(rq == NULL);
+    BUG_ON(req == NULL);
 
-    /* Allocate a tag for this request. */
-    BUG_ON(dev->blk_pending == NULL);
+    tail = ACCESS_ONCE(dev->pending_delivery_tail);
 
-    rq_for_each_segment(bvec, rq, iter) {
-        struct bio *bio = iter.bio;
-        size_t req_size = sizeof(*ureq);
-        void *data = NULL;
-        bool unfinished;
-
-        BUG_ON(bio == NULL);
-        BUG_ON(bio_segments(bio) != 1);
-
-        if (blk_queue_start_tag(dev->blk_pending, rq)) {
-            // Couldn't allocate the tag.  Don't pull it off the queue.
-            printk(KERN_INFO "[%d] ubdblk_handle_fs_request: failed to "
-                   "allocate a tag.\n", current->pid);
-            return;
-        }
-
-        printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: request tag=%d, "
-               "size=%d\n", current->pid, rq->tag, bio_sectors(rq->bio) * 512);
-
-        /* Allocate the message structure */
-        if ((msg = kmalloc(sizeof(*msg), GFP_NOIO)) == NULL) {
-            printk(KERN_ERR "[%d] ubdblk_handle_fs_request: failed to "
-                   "allocate %zu bytes for request.\n", current->pid,
-                   sizeof(*msg));
-            blk_start_request(rq);
-            unfinished = blk_end_request_err(rq, -ENOMEM);
-            BUG_ON(unfinished);
-            return;
-        }
-
-        if (bio_data_dir(bio) == WRITE && (bio->bi_rw & REQ_DISCARD) == 0) {
-            /* Write request -- requires extra data. */
-            size_t cur_bytes = bio_cur_bytes(bio);
-            req_size += cur_bytes;
-            data = bio_data(bio);
-        }
-
-        /* Allocate the request structure */
-        if ((ureq = kmalloc(req_size, GFP_NOIO)) == NULL) {
-            printk(KERN_ERR "[%d] ubdblk_handle_fs_request: failed to "
-                   "allocate %zu bytes for request.\n", current->pid,
-                   req_size);
-            kfree(msg);
-            blk_start_request(rq);
-            unfinished = blk_end_request_err(rq, -ENOMEM);
-            BUG_ON(unfinished);
-            return;
-        }
-
-        /* Initialize the request */
-        msg->n_written = 0;
-        msg->request = ureq;
-        ureq->ubd_header.ubd_msgtype = (
-            bio_data_dir(bio) != WRITE ? UBD_MSGTYPE_READ_REQUEST : (
-                bio->bi_rw & REQ_DISCARD ? UBD_MSGTYPE_DISCARD_REQUEST :
-                UBD_MSGTYPE_WRITE_REQUEST));
-        ureq->ubd_header.ubd_size = req_size;
-        ureq->ubd_header.ubd_tag = rq->tag;
-        ureq->ubd_first_sector = ubd_first_sector(iter);
-        ureq->ubd_nsectors = bio_sectors(bio);
-
-        if (data != NULL) {
-            memcpy(ureq->ubd_data, data, bio_cur_bytes(bio));
-        }
-
-        /* Queue the request for the control endpoint. */
-        mutex_lock(&dev->outgoing_lock);
-        list_add_tail(&msg->list, &dev->ctl_outgoing_head);
-        n_pending = atomic_inc_return(&dev->n_pending);
-        printk(KERN_DEBUG "[%d] ubdblk_handle_fs_request: n_pending now %d\n",
-               current->pid, n_pending);
-        mutex_unlock(&dev->outgoing_lock);
-        wake_up_interruptible(&dev->ctl_outgoing_wait);
+    ACCESS_ONCE(dev->pending_delivery_tail) = req;
+    if (tail == NULL) {
+        ACCESS_ONCE(dev->pending_delivery_head) = req;
     }
 
+    req->special = NULL;
+    wake_up_locked(&dev->wait);
     return;
 }
 
