@@ -754,6 +754,68 @@ static long ubdctl_ioctl_describe(
 }
 
 
+static long ubdctl_ioctl_tie(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    struct ublkdev *dev;
+    unsigned long lock_flags;
+    uint32_t n_control_handles;
+
+    dev = filp->private_data;
+    if (dev != NULL) {
+        // Untie the existing device.
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        // Decrement the control handle count and possibly free up the
+        // structure.
+        n_control_handles = ACCESS_ONCE(dev->n_control_handles) - 1;
+        ACCESS_ONCE(dev->n_control_handles) = n_control_handles;
+
+        if (n_control_handles == 0 &&
+            ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED &&
+            ACCESS_ONCE(dev->n_block_handles) == 0)
+        {
+            // Nothing else can acquire this device.
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+            ubd_free_ublkdev(dev);
+        } else {
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        }
+
+        filp->private_data = NULL;
+    }
+
+    if (data != 0) {
+        // Attempt to tie this to a new device.
+        if (data > UINT_MAX) {
+            ubd_warning("Major device number %lu out of range.", data);
+            return -EINVAL;
+        }
+
+        mutex_lock(&ubd_devices_lock);
+        dev = ubd_find_device_by_major((uint32_t) data);
+        if (dev == NULL) {
+            mutex_unlock(&ubd_devices_lock);
+            ubd_warning("Unknown device major %lu.", data);
+            return -EINVAL;
+        }
+        
+        // Increment the control handle count on this device.
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        n_control_handles = ACCESS_ONCE(dev->n_control_handles);
+        ACCESS_ONCE(dev->n_control_handles) = n_control_handles + 1;
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
+        mutex_unlock(&ubd_devices_lock);
+
+        filp->private_data = dev;
+    }
+
+    return 0;
+}
+
+
 static long ubdctl_ioctl_putreply(
     struct file *filp,
     unsigned int cmd,
@@ -909,6 +971,10 @@ static long ubdctl_ioctl_putreply(
 
 done:
     return result;
+
+#undef UBD_ABORT
+#undef UBD_FINISH_ERR
+#undef UBD_FINISH
 }
 
 
@@ -1060,7 +1126,7 @@ static void ubdblk_handle_request(struct request_queue *rq) {
                 break;
 
             default:
-                ubd_err("Unknown request type 0x%x\n", req->cmd_type);
+                ubd_err("Unknown request type 0x%x", req->cmd_type);
                 unfinished = blk_end_request_err(req, -EIO);
                 BUG_ON(unfinished);
                 break;
