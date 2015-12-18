@@ -7,13 +7,14 @@
 
 #ifndef __KERNEL__
 #include <inttypes.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #else
 #include <linux/types.h>
 #endif
 
 /** ubd ioctl magic number -- seems unused */
-#define UBD_IOC_MAGIC           0xbf
+#define UBD_IOC_MAGIC       0xbf
 
 /** ioctl: register block device. */
 #define UBD_IOCREGISTER     _IOWR(UBD_IOC_MAGIC, 0xa0, struct ubd_info)

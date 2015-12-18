@@ -7,23 +7,17 @@ import select
 import struct
 from .ioctl import _IOR, _IOW, _IOWR
 
-DISK_NAME_LEN = 32
-
-UBD_IOCREGISTER = 0xc038bfa0
-UBD_IOCUNREGISTER = 0xbfa1
-UBD_IOCGETCOUNT = 0x8004bfa2
-UBD_IOCDESCRIBE = 0xc040bfa3
+UBD_DISK_NAME_LEN = 32
 
 UBD_FL_READ_ONLY = 0x00000001
 UBD_FL_REMOVABLE = 0x00000002
 
 class UBDInfo(ctypes.Structure):
     _fields_ = [
-        ("ubd_name", ctypes.c_char * DISK_NAME_LEN),
+        ("ubd_name", ctypes.c_char * UBD_DISK_NAME_LEN),
         ("ubd_flags", ctypes.c_uint32),
-        ("ubd_nsectors", ctypes.c_uint64),
         ("ubd_major", ctypes.c_uint32),
-        ("ubd_minor", ctypes.c_uint32),
+        ("ubd_nsectors", ctypes.c_uint64),
     ]
 
 class UBDDescribe(ctypes.Structure):
@@ -53,14 +47,23 @@ UBD_MSGTYPE_READ = 0
 UBD_MSGTYPE_WRITE = 1
 UBD_MSGTYPE_DISCARD = 2
 
-UBD_IOC_MAGIC = 0xaf
+UBD_IOC_MAGIC = 0xbf
 UBD_IOCREGISTER = _IOWR(UBD_IOC_MAGIC, 0xa0, ctypes.sizeof(UBDInfo))
-UBD_IOCUNREGISTER = _IOWR(UBD_IOC_MAGIC, 0xa1, ctypes.sizeof(ctypes.c_int))
+UBD_IOCUNREGISTER = _IOW(UBD_IOC_MAGIC, 0xa1, ctypes.sizeof(ctypes.c_int))
 UBD_IOCGETCOUNT = _IOR(UBD_IOC_MAGIC, 0xa2, ctypes.sizeof(ctypes.c_int))
 UBD_IOCDESCRIBE = _IOWR(UBD_IOC_MAGIC, 0xa3, ctypes.sizeof(UBDDescribe))
 UBD_IOCTIE = _IOW(UBD_IOC_MAGIC, 0xa4, ctypes.sizeof(ctypes.c_int))
 UBD_IOCGETREQUEST = _IOWR(UBD_IOC_MAGIC, 0xa5, ctypes.sizeof(UBDMessage))
 UBD_IOCPUTREPLY = _IOW(UBD_IOC_MAGIC, 0xa6, ctypes.sizeof(UBDMessage))
+
+print(hex(UBD_IOCREGISTER))
+assert UBD_IOCREGISTER == 0xc030bfa0
+assert UBD_IOCUNREGISTER == 0x4004bfa1
+assert UBD_IOCGETCOUNT == 0x8004bfa2
+assert UBD_IOCDESCRIBE == 0xc038bfa3
+assert UBD_IOCTIE == 0x4004bfa4
+assert UBD_IOCGETREQUEST == 0xc028bfa5
+assert UBD_IOCPUTREPLY == 0x4028bfa6
 
 UBD_FL_READ_ONLY = 0x00000001
 UBD_FL_REMOVABLE = 0x00000002
