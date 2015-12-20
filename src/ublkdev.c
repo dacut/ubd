@@ -573,7 +573,7 @@ static long ubdctl_ioctl_unregister(
     dev = ubd_find_device_by_major(major);
     if (dev == NULL) {
         mutex_unlock(&ubd_devices_lock);
-        ubd_info("Unknown major device %d", major);
+        ubd_info("Unknown major device %d. (originally %lu)", major, data);
         return -EINVAL;
     }
 

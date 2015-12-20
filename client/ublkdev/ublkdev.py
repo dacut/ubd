@@ -88,7 +88,7 @@ class UserBlockDevice(object):
         return
 
     def unregister(self, major):
-        fcntl.ioctl(self.control, UBD_IOCUNREGISTER, ctypes.c_int(major))
+        fcntl.ioctl(self.control, UBD_IOCUNREGISTER, major)
         return
 
     @property

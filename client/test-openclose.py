@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-from ublkdev import *
+import sys
+sys.path.append(".")
+
+from ublkdev.ublkdev import *
 ubd = UserBlockDevice()
 print ubd.count
-ubd.register("foo", 1024)
+print ubd.unregister(1)
