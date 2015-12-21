@@ -5,6 +5,7 @@ import fcntl
 import os
 import select
 import struct
+import sys
 from .ioctl import _IOR, _IOW, _IOWR
 
 UBD_DISK_NAME_LEN = 32
@@ -107,10 +108,36 @@ class UserBlockDevice(object):
         msg = UBDMessage()
         buf = ctypes.create_string_buffer(UBD_BUFFER_SIZE)
         msg.ubd_size = UBD_BUFFER_SIZE
-        msg.ubd_data = byref(buf)
+        msg.ubd_data = buf
         fcntl.ioctl(self.control, UBD_IOCGETREQUEST, msg)
         return msg
 
     def put_reply(self, msg):
         fcntl.ioctl(self.control, UBD_IOCPUTREPLY, msg)
         return
+
+def unregister(args=None):
+    if args is None:
+        args = sys.argv[1:]
+
+    if len(args) == 0:
+        print("Usage: %s <device>" % sys.argv[0], file=sys.stderr)
+        return 1
+
+    try:
+        ubd = UserBlockDevice()
+    except OSError as e:
+        print("Unable to open endpoint /dev/ubd: %s" % os.strerror(e.errno),
+              file=sys.stderr)
+        return 1
+
+    errors = False
+    for endpoint in args:
+        try:
+            major = os.stat(endpoint).st_rdev >> 8
+            ubd.unregister(major)
+        except (OSError, IOError) as e:
+            print("%s: %s" % (endpoint, os.strerror(e.errno)), file=sys.stderr)
+            errors = True
+
+    return 0 if not errors else 1

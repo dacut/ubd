@@ -13,7 +13,8 @@ setup(
     packages=['ublkdev'],
     entry_points={
         "console_scripts": [
-            "ubds3=ublkdev.s3:main",
+            "ubd-s3=ublkdev.s3:main",
+            "ubd-unregister=ublkdev.ublkdev:unregister",
         ]
     },
     install_requires=["boto>=2.0", "six>=1.0"],
