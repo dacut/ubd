@@ -66,6 +66,8 @@ assert UBD_IOCPUTREPLY == 0x4028bfa6
 
 UBD_FL_READ_ONLY = 0x00000001
 UBD_FL_REMOVABLE = 0x00000002
+
+UBD_BUFFER_SIZE = 4 << 20
     
 class UserBlockDevice(object):
     def __init__(self, control_endpoint="/dev/ubdctl", buffer_size=65536):
@@ -101,9 +103,11 @@ class UserBlockDevice(object):
         fcntl.ioctl(self.control, UBD_IOCDESCRIBE, ubd_describe)
         return ubd_describe.ubd_info
 
-    def get_request(self, buf):
+    def get_request(self):
         msg = UBDMessage()
-        msg.ubd_data = buf
+        buf = ctypes.create_string_buffer(UBD_BUFFER_SIZE)
+        msg.ubd_size = UBD_BUFFER_SIZE
+        msg.ubd_data = byref(buf)
         fcntl.ioctl(self.control, UBD_IOCGETREQUEST, msg)
         return msg
 

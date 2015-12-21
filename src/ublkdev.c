@@ -96,8 +96,9 @@ static struct ublkdev *ubd_find_device_by_major(uint32_t major) {
 static void ubd_free_ublkdev(struct ublkdev *dev) {
     BUG_ON(dev == NULL);
     BUG_ON(ACCESS_ONCE(dev->status) != UBD_STATUS_TERMINATED);
-    
+
     blk_cleanup_queue(dev->in_flight);
+    del_gendisk(dev->disk);
     kfree(dev->pending_reply);
     kfree(dev);
 
