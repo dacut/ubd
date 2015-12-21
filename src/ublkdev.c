@@ -104,6 +104,84 @@ static void ubd_free_ublkdev(struct ublkdev *dev) {
     return;
 }
 
+/** Fail all requests on a block endpoint.
+ *
+ *  The device lock must be held.
+ *
+ *  @param  dev         The device to fail requests on.
+ *  @param  lock_flags  Flags saved from the device lock.
+ */
+static void ubd_fail_requests(struct ublkdev *dev, unsigned long lock_flags) {
+    struct request *req;
+    bool unfinished;
+    size_t i;
+
+    /* Increase the control handle count while unregistering so we don't
+     * release the structure while we're still in this routine.
+     */
+    ACCESS_ONCE(dev->n_control_handles) =
+        ACCESS_ONCE(dev->n_control_handles) + 1;
+
+    /* Don't deliver any messages pending delivery. */
+    while ((req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL) {
+        /* Pop the top of the pending_delivery list.  The special field
+         * is used to point to the next request.
+         */
+        struct request *next_request;
+        
+        next_request = (struct request *) ACCESS_ONCE(req->special);
+        ACCESS_ONCE(dev->pending_delivery_head) = next_request;
+
+        if (next_request == NULL) {
+            /* Removed the last item; axe the tail. */
+            ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
+        }
+
+        /* We can't have device lock held while holding the queue lock. */
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
+        /* Fail this request.  This requires the queue lock to be held. */
+        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
+        unfinished = blk_end_request_err(req, -EIO);
+        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
+
+        BUG_ON(unfinished);
+
+        /* Reacquire the device lock. */
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    }
+
+    /* Fail any messages awaiting a reply. */
+    for (i = 0; i < dev->max_pending_reply; ++i) {
+        if ((req = ACCESS_ONCE(dev->pending_reply[i])) != NULL) {
+            uint32_t n_pending_reply = ACCESS_ONCE(dev->n_pending_reply);
+            BUG_ON(n_pending_reply == 0);
+
+            --n_pending_reply;
+            ACCESS_ONCE(dev->n_pending_reply) = n_pending_reply;
+            ACCESS_ONCE(dev->pending_reply[i]) = NULL;
+            
+            /* We can't have device lock held while holding the queue lock. */
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
+            /* Fail this request.  This requires the queue lock to be held. */
+            spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
+            unfinished = blk_end_request_err(req, -EIO);
+            spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
+                
+            BUG_ON(unfinished);
+
+            /* Reacquire the device lock. */
+            spin_lock_irqsave(&dev->wait.lock, lock_flags);
+        }
+    }
+
+    /* Decrement the control handle count we held earlier. */
+    ACCESS_ONCE(dev->n_control_handles) = 
+        ACCESS_ONCE(dev->n_control_handles) - 1;
+    return;
+}
+
 /* ***** Control endpoint functions ***** */
 
 /** Handler for open() on the control endpoint. */
@@ -281,6 +359,64 @@ static void __exit ubd_exit(void) {
 }
 
 static void ubd_teardown(void) {
+    struct list_head *el, *next;
+
+    mutex_lock(&ubd_devices_lock);
+    list_for_each_safe(el, next, &ubd_devices) {
+        struct ublkdev *dev = list_entry(el, struct ublkdev, list);
+        struct gendisk *disk;
+        unsigned long lock_flags;
+        uint32_t status;
+
+        spin_lock_irqsave(&dev->wait.lock, lock_flags);
+
+        // If we're still registering, wait for add_disk to finish.
+        wait_event_lock_irq(
+            dev->wait,
+            (status = ACCESS_ONCE(dev->status)) != UBD_STATUS_REGISTERING,
+            dev->wait.lock);
+
+        // We shouldn't have even seen the device if it's terminating.
+        BUG_ON(status != UBD_STATUS_RUNNING);
+        disk = ACCESS_ONCE(dev->disk);
+        BUG_ON(disk == NULL);
+
+        ubd_debug("Unregistering device \"%s\".", disk->disk_name);
+        
+        // Unregister this device.
+        ACCESS_ONCE(dev->status) = UBD_STATUS_TERMINATED;
+            
+        // Remove this device from the list of devices.
+        list_del(el);
+
+        ubd_debug("Failing requests.");
+        
+        // Fail all requests on this device.
+        ubd_fail_requests(dev, lock_flags);
+
+        ubd_debug("Notifying waiters about status change.");
+
+        // Notify anyone waiting on a status change.
+        smp_wmb();
+        wake_up_all_locked(&dev->wait);
+
+        ubd_debug("Waiting for handles to vanish (%d control, %d block).",
+                  ACCESS_ONCE(dev->n_control_handles),
+                  ACCESS_ONCE(dev->n_block_handles));
+
+        /* Wait for all handles to this device to close. */
+        wait_event_lock_irq(
+            dev->wait,
+            ACCESS_ONCE(dev->n_control_handles) == 0 &&
+            ACCESS_ONCE(dev->n_block_handles) == 0,
+            dev->wait.lock);
+            
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        
+        ubd_free_ublkdev(dev);
+    }
+    mutex_unlock(&ubd_devices_lock);
+
     if (ubd_major != 0) {
         ubd_debug("Unregistering block device (major %d)", ubd_major);
         unregister_blkdev(ubd_major, "ubd");
@@ -501,7 +637,7 @@ static long ubdctl_ioctl_register(
         return -ENOMEM;
     }
 
-    /* Initialize the rest of the gendisk structure. */
+    // Initialize the rest of the gendisk structure.
     disk->major = major;
     disk->first_minor = 0;
     memcpy(disk->disk_name, info.ubd_name, DISK_NAME_LEN);
@@ -512,23 +648,23 @@ static long ubdctl_ioctl_register(
     set_capacity(disk, info.ubd_nsectors);
     disk->private_data = dev;
 
-    /* No requests pending delivery. */
+    // No requests pending delivery.
     dev->pending_delivery_head = dev->pending_delivery_tail = NULL;
 
-    /* Mark this device as registering. */
+    // Mark this device as registering.
     dev->status = UBD_STATUS_REGISTERING;
 
-    /* Initialize the status change wait queue. */
+    // Initialize the status change wait queue.
     init_waitqueue_head(&dev->wait);
 
-    /* Copy flags over. */
+    // Copy flags over.
     dev->flags = info.ubd_flags;
 
-    /* Nobody has this open or tied yet. */
+    // Nobody has this open or tied yet.
     dev->n_control_handles = 0;
     dev->n_block_handles = 0;
 
-    /* Flush everything before the work function might start. */
+    // Flush everything before the work function might start.
     smp_wmb();
 
     /* Asynchronously add the disk.  Otherwise, there can be a race condition
@@ -561,12 +697,8 @@ static long ubdctl_ioctl_unregister(
 {
     int major = (int) data;
     struct ublkdev *dev;
-    struct request *req;
     unsigned long lock_flags;
     uint32_t status;
-    uint32_t n_control_handles;
-    bool unfinished;
-    size_t i;
 
     mutex_lock(&ubd_devices_lock);
 
@@ -601,72 +733,16 @@ static long ubdctl_ioctl_unregister(
     list_del(&dev->list);
     mutex_unlock(&ubd_devices_lock);
 
-    /* Increase the control handle count while unregistering so we don't
-     * release the structure while we're still in this routine.
-     */
-    ACCESS_ONCE(dev->n_control_handles) =
-        ACCESS_ONCE(dev->n_control_handles) + 1;
+    /* Fail all requests on this device. */
+    ubd_fail_requests(dev, lock_flags);
 
-    /* Don't deliver any messages pending delivery. */
-    while ((req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL) {
-        /* Pop the top of the pending_delivery list.  The special field
-         * is used to point to the next request.
-         */
-        struct request *next_request;
-        
-        next_request = (struct request *) ACCESS_ONCE(req->special);
-        ACCESS_ONCE(dev->pending_delivery_head) = next_request;
+    /* Notify anyone waiting on a status change. */
+    smp_wmb();
+    wake_up_all_locked(&dev->wait);
 
-        if (next_request == NULL) {
-            /* Removed the last item; axe the tail. */
-            ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
-        }
-
-        /* We can't have device lock held while holding the queue lock. */
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-
-        /* Fail this request.  This requires the queue lock to be held. */
-        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
-        unfinished = blk_end_request_err(req, -EIO);
-        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
-
-        BUG_ON(unfinished);
-
-        /* Reacquire the device lock. */
-        spin_lock_irqsave(&dev->wait.lock, lock_flags);
-    }
-
-    /* Fail any messages awaiting a reply. */
-    for (i = 0; i < dev->max_pending_reply; ++i) {
-        if ((req = ACCESS_ONCE(dev->pending_reply[i])) != NULL) {
-            uint32_t n_pending_reply = ACCESS_ONCE(dev->n_pending_reply);
-            BUG_ON(n_pending_reply == 0);
-
-            --n_pending_reply;
-            ACCESS_ONCE(dev->n_pending_reply) = n_pending_reply;
-            ACCESS_ONCE(dev->pending_reply[i]) = NULL;
-            
-            /* We can't have device lock held while holding the queue lock. */
-            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-
-            /* Fail this request.  This requires the queue lock to be held. */
-            spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
-            unfinished = blk_end_request_err(req, -EIO);
-            spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
-                
-            BUG_ON(unfinished);
-
-            /* Reacquire the device lock. */
-            spin_lock_irqsave(&dev->wait.lock, lock_flags);
-        }
-    }
-
-    /* Decrement the control handle count we held earlier. */
-    n_control_handles = ACCESS_ONCE(dev->n_control_handles);
-    --n_control_handles;
-    ACCESS_ONCE(dev->n_control_handles) = n_control_handles;
-
-    if (n_control_handles == 0 && ACCESS_ONCE(dev->n_block_handles) == 0) {
+    if (ACCESS_ONCE(dev->n_control_handles) == 0 &&
+        ACCESS_ONCE(dev->n_block_handles) == 0)
+    {
         // Nothing else can acquire this device.
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         ubd_free_ublkdev(dev);        
@@ -758,58 +834,69 @@ static long ubdctl_ioctl_tie(
     unsigned int cmd,
     unsigned long data)
 {
-    struct ublkdev *dev;
+    struct ublkdev *olddev, *newdev;
     unsigned long lock_flags;
     uint32_t n_control_handles;
 
-    dev = filp->private_data;
-    if (dev != NULL) {
-        // Untie the existing device.
-        spin_lock_irqsave(&dev->wait.lock, lock_flags);
-        // Decrement the control handle count and possibly free up the
-        // structure.
-        n_control_handles = ACCESS_ONCE(dev->n_control_handles) - 1;
-        ACCESS_ONCE(dev->n_control_handles) = n_control_handles;
-
-        if (n_control_handles == 0 &&
-            ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED &&
-            ACCESS_ONCE(dev->n_block_handles) == 0)
-        {
-            // Nothing else can acquire this device.
-            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-            ubd_free_ublkdev(dev);
-        } else {
-            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-        }
-
-        filp->private_data = NULL;
+    // Attempt to tie this to a new device.
+    if (data > UINT_MAX) {
+        ubd_warning("Major device number %lu out of range.", data);
+        return -EINVAL;
     }
 
-    if (data != 0) {
-        // Attempt to tie this to a new device.
-        if (data > UINT_MAX) {
-            ubd_warning("Major device number %lu out of range.", data);
-            return -EINVAL;
-        }
+    mutex_lock(&ubd_devices_lock);
 
-        mutex_lock(&ubd_devices_lock);
-        dev = ubd_find_device_by_major((uint32_t) data);
-        if (dev == NULL) {
+    if (data != 0) {
+        newdev = ubd_find_device_by_major((uint32_t) data);
+        if (newdev == NULL) {
             mutex_unlock(&ubd_devices_lock);
             ubd_warning("Unknown device major %lu.", data);
             return -ENODEV;
         }
-        
-        // Increment the control handle count on this device.
-        spin_lock_irqsave(&dev->wait.lock, lock_flags);
-        n_control_handles = ACCESS_ONCE(dev->n_control_handles);
-        ACCESS_ONCE(dev->n_control_handles) = n_control_handles + 1;
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-
-        mutex_unlock(&ubd_devices_lock);
-
-        filp->private_data = dev;
+    } else {
+        newdev = NULL;
     }
+
+    olddev = filp->private_data;
+    if (olddev != NULL && newdev != olddev) {
+        // Untie the existing device.
+        spin_lock_irqsave(&olddev->wait.lock, lock_flags);
+        // Decrement the control handle count and possibly free up the
+        // structure.
+        n_control_handles = ACCESS_ONCE(olddev->n_control_handles) - 1;
+        ACCESS_ONCE(olddev->n_control_handles) = n_control_handles;
+
+        // Notify anyone waiting on the control handle count to change.
+        smp_wmb();
+        wake_up_all_locked(&olddev->wait);
+
+        if (n_control_handles == 0 &&
+            ACCESS_ONCE(olddev->status) == UBD_STATUS_TERMINATED &&
+            ACCESS_ONCE(olddev->n_block_handles) == 0)
+        {
+            // Nothing else can acquire this device.
+            spin_unlock_irqrestore(&olddev->wait.lock, lock_flags);
+            ubd_free_ublkdev(olddev);
+        } else {
+            spin_unlock_irqrestore(&olddev->wait.lock, lock_flags);
+        }
+    }
+
+    if (newdev != NULL && newdev != olddev) {
+        // Increment the control handle count on this device.
+        spin_lock_irqsave(&newdev->wait.lock, lock_flags);
+        n_control_handles = ACCESS_ONCE(newdev->n_control_handles) + 1;
+        ACCESS_ONCE(newdev->n_control_handles) = n_control_handles;
+
+        // Notify anyone waiting on the control handle count to change.
+        smp_wmb();
+        wake_up_all_locked(&newdev->wait);
+        
+        spin_unlock_irqrestore(&newdev->wait.lock, lock_flags);
+    }
+
+    filp->private_data = newdev;
+    mutex_unlock(&ubd_devices_lock);
 
     return 0;
 }
