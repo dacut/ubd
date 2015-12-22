@@ -15,6 +15,7 @@ setup(
         "console_scripts": [
             "ubd-s3=ublkdev.s3:main",
             "ubd-unregister=ublkdev.ublkdev:unregister",
+            "ubd-debug=ublkdev.ublkdev:debug",
         ]
     },
     install_requires=["boto>=2.0", "six>=1.0"],

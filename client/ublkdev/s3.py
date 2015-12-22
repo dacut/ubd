@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 from base64 import b64decode, b64encode
 from boto.exception import S3ResponseError
 import boto.s3
+from ctypes import create_string_buffer
 from errno import EIO
 from getopt import getopt, GetoptError
 from json import dumps as json_dumps, loads as json_loads
@@ -42,12 +43,12 @@ class UBDS3Handler(Thread):
         while not volume.stop_requested:
             with volume.request_lock:
                 try:
-                    request = volume.request_queue.pop()
+                    request, buf = volume.request_queue.pop()
                 except IndexError:
                     volume.request_lock.wait(1)
                     continue
             
-            volume.handle_ubd_request(self.bucket, request)
+            volume.handle_ubd_request(self.bucket, request, buf)
         return
 
 class UBDS3Volume(object):
@@ -61,6 +62,8 @@ class UBDS3Volume(object):
 
         self.ubd = None
         self.n_threads = n_threads
+        self.buffers = [create_string_buffer(4 << 20)
+                        for i in xrange(2 * n_threads)]
 
         self.block_size = None
         self.encryption = None
@@ -70,6 +73,7 @@ class UBDS3Volume(object):
         self.suffix = None
 
         self.request_queue = []
+        self.buffers_lock = Lock()
         self.request_lock = Condition()
         self.stop_requested = False
         return
@@ -84,7 +88,8 @@ class UBDS3Volume(object):
                  self.devname, n_sectors)
 
         self.ubd = UserBlockDevice()
-        self.ubd.register(self.devname, n_sectors)
+        info = self.ubd.register(self.devname, n_sectors)
+        self.ubd.tie(info.ubd_major)
         return
 
     def run(self):
@@ -97,9 +102,15 @@ class UBDS3Volume(object):
                 thread.start()
 
             while not self.stop_requested:
-                request = self.ubd.get_request()
+                with self.buffers_lock:
+                    try:
+                        buf = self.buffers.pop()
+                    except IndexError:
+                        buf = create_string_buffer(4 << 20)
+
+                request = self.ubd.get_request(buf)
                 with self.request_lock:
-                    self.request_queue.append(request)
+                    self.request_queue.append((request, buf))
                     self.request_lock.notify()
         finally:
             self.stop_requested = True
@@ -158,7 +169,7 @@ class UBDS3Volume(object):
         self.suffix = suffix
         return
 
-    def handle_ubd_request(self, bucket, msg):
+    def handle_ubd_request(self, bucket, msg, buf):
         """
         s3handler.handle_ubd_request(bucket, ubd_request)
         """
@@ -169,12 +180,12 @@ class UBDS3Volume(object):
 
         try:
             if req_type == UBD_MSGTYPE_READ:
-                msg.ubd_data[:length] = self.read(bucket, offset, length)
+                buf[:length] = self.read(bucket, offset, length)
                 msg.ubd_size = length
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_WRITE_REQUEST:
                 log.debug("write offset=%d length=%d", offset, length)
-                self.write(bucket, offset, msg.ubd_data.raw[:length])
+                self.write(bucket, offset, buf.raw[:length])
                 msg.ubd_size = 0
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_DISCARD_REQUEST:
@@ -186,6 +197,8 @@ class UBDS3Volume(object):
             reply_status = -e.errno
 
         self.ubd.put_reply(msg)
+        with self.buffers_lock:
+            self.buffers.append(buf)
             
         return
 

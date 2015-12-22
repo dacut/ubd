@@ -6,7 +6,7 @@ import os
 import select
 import struct
 import sys
-from .ioctl import _IOR, _IOW, _IOWR
+from .ioctl import _IO, _IOR, _IOW, _IOWR
 
 UBD_DISK_NAME_LEN = 32
 
@@ -56,6 +56,7 @@ UBD_IOCDESCRIBE = _IOWR(UBD_IOC_MAGIC, 0xa3, ctypes.sizeof(UBDDescribe))
 UBD_IOCTIE = _IOW(UBD_IOC_MAGIC, 0xa4, ctypes.sizeof(ctypes.c_int))
 UBD_IOCGETREQUEST = _IOWR(UBD_IOC_MAGIC, 0xa5, ctypes.sizeof(UBDMessage))
 UBD_IOCPUTREPLY = _IOW(UBD_IOC_MAGIC, 0xa6, ctypes.sizeof(UBDMessage))
+UBD_IOCDEBUG = _IO(UBD_IOC_MAGIC, 0xa7)
 
 assert UBD_IOCREGISTER == 0xc030bfa0
 assert UBD_IOCUNREGISTER == 0x4004bfa1
@@ -68,8 +69,6 @@ assert UBD_IOCPUTREPLY == 0x4028bfa6
 UBD_FL_READ_ONLY = 0x00000001
 UBD_FL_REMOVABLE = 0x00000002
 
-UBD_BUFFER_SIZE = 4 << 20
-    
 class UserBlockDevice(object):
     def __init__(self, control_endpoint="/dev/ubdctl", buffer_size=65536):
         super(UserBlockDevice, self).__init__()
@@ -88,7 +87,7 @@ class UserBlockDevice(object):
         ubd_info.ubd_minor = 0
 
         fcntl.ioctl(self.control, UBD_IOCREGISTER, ubd_info)
-        return
+        return ubd_info
 
     def unregister(self, major):
         fcntl.ioctl(self.control, UBD_IOCUNREGISTER, major)
@@ -104,17 +103,23 @@ class UserBlockDevice(object):
         fcntl.ioctl(self.control, UBD_IOCDESCRIBE, ubd_describe)
         return ubd_describe.ubd_info
 
-    def get_request(self):
+    def tie(self, major):
+        fcntl.ioctl(self.control, UBD_IOCTIE, major)
+        return
+
+    def get_request(self, buf):
         msg = UBDMessage()
-        buf = ctypes.create_string_buffer(UBD_BUFFER_SIZE)
-        msg.ubd_size = UBD_BUFFER_SIZE
-        msg.ubd_data = buf
+        msg.ubd_size = len(buf)
+        msg.ubd_data = ctypes.cast(buf, ctypes.c_char_p)
         fcntl.ioctl(self.control, UBD_IOCGETREQUEST, msg)
         return msg
 
     def put_reply(self, msg):
         fcntl.ioctl(self.control, UBD_IOCPUTREPLY, msg)
         return
+
+    def debug(self):
+        fcntl.ioctl(self.control, UBD_IOCDEBUG)
 
 def unregister(args=None):
     if args is None:
@@ -141,3 +146,6 @@ def unregister(args=None):
             errors = True
 
     return 0 if not errors else 1
+
+def debug(args=None):
+    UserBlockDevice().debug()

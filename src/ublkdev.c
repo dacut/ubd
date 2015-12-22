@@ -19,10 +19,6 @@ MODULE_DESCRIPTION("Userspace block devices");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_VERSION("0.1");
 
-static int ubd_major = 0;
-module_param(ubd_major, int, 0444);
-MODULE_PARM_DESC(ubd_major, "UBD major node");
-
 /* ***** Driver global functions and variables. ***** */
 
 /** List of block devices allocated. */
@@ -87,6 +83,24 @@ static struct ublkdev *ubd_find_device_by_major(uint32_t major) {
     return NULL;
 }
 
+/** Convert a message type to a string.
+ *
+ *  @param  msgtype     The message type to decode.
+ *  @param  buffer      A buffer to write a dynamic message to.  This must be
+ *                      at least 32 bytes.
+ */
+static char const *ubd_msgtype_to_string(uint32_t msgtype, char *buffer) {
+    switch (msgtype) {
+    case UBD_MSGTYPE_READ: return "UBD_MSGTYPE_READ";
+    case UBD_MSGTYPE_WRITE: return "UBD_MSGTYPE_WRITE";
+    case UBD_MSGTYPE_DISCARD: return "UBD_MSGTYPE_DISCARD";
+    case UBD_MSGTYPE_FLUSH: return "UBD_MSGTYPE_FLUSH";
+    default:
+        sprintf(buffer, "Unknown message type %d", msgtype);
+        return buffer;
+    }
+}
+
 /** Free a block device.
  *
  *  The device must be terminated.  No locks may be held.
@@ -138,18 +152,8 @@ static void ubd_fail_requests(struct ublkdev *dev, unsigned long lock_flags) {
             ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
         }
 
-        /* We can't have device lock held while holding the queue lock. */
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-
-        /* Fail this request.  This requires the queue lock to be held. */
-        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
         unfinished = blk_end_request_err(req, -EIO);
-        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
-
         BUG_ON(unfinished);
-
-        /* Reacquire the device lock. */
-        spin_lock_irqsave(&dev->wait.lock, lock_flags);
     }
 
     /* Fail any messages awaiting a reply. */
@@ -162,18 +166,8 @@ static void ubd_fail_requests(struct ublkdev *dev, unsigned long lock_flags) {
             ACCESS_ONCE(dev->n_pending_reply) = n_pending_reply;
             ACCESS_ONCE(dev->pending_reply[i]) = NULL;
             
-            /* We can't have device lock held while holding the queue lock. */
-            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-
-            /* Fail this request.  This requires the queue lock to be held. */
-            spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);
             unfinished = blk_end_request_err(req, -EIO);
-            spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags);
-                
             BUG_ON(unfinished);
-
-            /* Reacquire the device lock. */
-            spin_lock_irqsave(&dev->wait.lock, lock_flags);
         }
     }
 
@@ -248,6 +242,12 @@ static long ubdctl_ioctl_getrequest(
 
 /** Handle a reply from the control endpoint back to the block endpoint. */
 static long ubdctl_ioctl_putreply(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data);
+
+/** Print debugging information to the console. */
+static long ubdctl_ioctl_debug(
     struct file *filp,
     unsigned int cmd,
     unsigned long data);
@@ -333,18 +333,6 @@ static int __init ubd_init(void) {
     ubd_debug("ubdctl registered as device %d:%d", MISC_MAJOR,
               ubdctl_miscdevice.minor);
 
-    /* Register the block device */
-    if ((result = register_blkdev(ubd_major, "ubd")) < 0) {
-        ubd_err("Failed to register block device: error code %d", result);
-        goto error;
-    }
-
-    if (ubd_major == 0) {
-        ubd_major = result;
-    }
-
-    ubd_debug("ubd block registered as device major %d", ubd_major);
-
     return 0;
 
 error:
@@ -417,12 +405,6 @@ static void ubd_teardown(void) {
         ubd_free_ublkdev(dev);
     }
     mutex_unlock(&ubd_devices_lock);
-
-    if (ubd_major != 0) {
-        ubd_debug("Unregistering block device (major %d)", ubd_major);
-        unregister_blkdev(ubd_major, "ubd");
-        ubd_major = 0;
-    }
 
     if (ubdctl_miscdevice.minor != MISC_DYNAMIC_MINOR) {
         ubd_debug("Unregistering ubdctl device %d:%d", MISC_MAJOR,
@@ -546,12 +528,14 @@ static long ubdctl_ioctl(
     case UBD_IOCPUTREPLY:
         return ubdctl_ioctl_putreply(filp, cmd, data);
 
+    case UBD_IOCDEBUG:
+        return ubdctl_ioctl_debug(filp, cmd, data);
+
     default:
         break;
     }
     
-    printk(KERN_INFO "[%d] ubdctl_ioctl: unknown ioctl 0x%x\n",
-           current->pid, cmd);
+    ubd_info("Unknown ioctl 0x%x", cmd);
     return -EINVAL;
 }
 
@@ -616,7 +600,7 @@ static long ubdctl_ioctl_register(
     dev->n_pending_reply = 0u;
     memset(dev->pending_reply, 0, UBD_INITIAL_PENDING_REPLY_SIZE);
 
-    /* Allocate and initialize the request queue. */
+    // Allocate and initialize the request queue.
     if ((dev->in_flight = blk_init_queue(ubdblk_handle_request, NULL)) == NULL)
     {
         ubd_err("Failed to allocate block request queue.");
@@ -625,6 +609,8 @@ static long ubdctl_ioctl_register(
         unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
+    
+    dev->in_flight->queuedata = dev;
     
     /* Allocate the disk structure.
      * XXX: Allow users to register more than 1 minor.
@@ -710,7 +696,9 @@ static long ubdctl_ioctl_unregister(
         return -EINVAL;
     }
 
+    ubd_debug("Acquiring device lock.");
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    ubd_debug("Device lock acquired.");
     status = ACCESS_ONCE(dev->status);
 
     if (status == UBD_STATUS_REGISTERING) {
@@ -727,17 +715,21 @@ static long ubdctl_ioctl_unregister(
         return -EINVAL;
     }
     
-    /* Start the unregister process. */
+    ubd_debug("Setting status to terminated.");
+    // Start the unregister process.
     ACCESS_ONCE(dev->status) = UBD_STATUS_TERMINATED;
 
-    /* Remove this device from the list of devices. */
+    // Remove this device from the list of devices.
+    ubd_debug("Removing device from list of devices.");
     list_del(&dev->list);
     mutex_unlock(&ubd_devices_lock);
 
-    /* Fail all requests on this device. */
+    // Fail all requests on this device.
+    ubd_debug("Failing all requests.");
     ubd_fail_requests(dev, lock_flags);
 
-    /* Notify anyone waiting on a status change. */
+    // Notify anyone waiting on a status change.
+    ubd_debug("Notifying waiters.");
     smp_wmb();
     wake_up_all_locked(&dev->wait);
 
@@ -745,10 +737,12 @@ static long ubdctl_ioctl_unregister(
         ACCESS_ONCE(dev->n_block_handles) == 0)
     {
         // Nothing else can acquire this device.
+        ubd_debug("No more handles open; freeing device.");
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         ubd_free_ublkdev(dev);        
     } else {
-        /* Allow the unmount to proceed asynchronously. */
+        // Allow the unmount to proceed asynchronously.
+        ubd_debug("Device handles are still open; will keep device up.");
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
     
@@ -938,6 +932,7 @@ static long ubdctl_ioctl_getrequest(
 
     // Wait for a message to become available *and* a tag slot to become
     // available.
+    ubd_debug("Will wait for a message to appear.");
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
     if (wait_event_interruptible_locked(
             dev->wait,
@@ -945,42 +940,68 @@ static long ubdctl_ioctl_getrequest(
             ACCESS_ONCE(dev->n_pending_reply) <
             ACCESS_ONCE(dev->max_pending_reply)))
     {
+        ubd_debug("Interrupted.");
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -ERESTARTSYS;
     }
 
-    // Attempt to deliver this request.
-    rq_for_each_segment(bvec, req, iter) {
-        struct bio *bio = iter.bio;
-        uint32_t n_sectors = bio_sectors(bio);
+    msg.ubd_nsectors = blk_rq_sectors(req);
+    msg.ubd_first_sector = blk_rq_pos(req);
+    msg.ubd_size = 0;
 
-        BUG_ON(bio_segments(bio) != 1);
+    // Fill in the remaining details.
+    if ((req->cmd_flags & REQ_DISCARD) != 0) {
+        ubd_debug("Got a discard request %p (sector %llu, n_sectors %u).",
+                  req, msg.ubd_first_sector, msg.ubd_nsectors);
+        msg.ubd_msgtype = UBD_MSGTYPE_DISCARD;
+    } else if ((req->cmd_flags & REQ_FLUSH) != 0) {
+        ubd_debug("Got a flush request %p (sector %llu, n_sectors %u).",
+                  req, msg.ubd_first_sector, msg.ubd_nsectors);
+        msg.ubd_msgtype = UBD_MSGTYPE_FLUSH;
+    } else if (rq_data_dir(req) == READ) {
+        ubd_debug("Got a read request %p (sector %llu, n_sectors %u).",
+                  req, msg.ubd_first_sector, msg.ubd_nsectors);
+        msg.ubd_msgtype = UBD_MSGTYPE_READ;
+    } else {
+        void __user *dest = msg.ubd_data;
+        uint32_t write_size = msg.ubd_nsectors << 9;
 
-        msg.ubd_nsectors = n_sectors;
-        msg.ubd_first_sector = ubd_first_sector(iter);
+        BUG_ON(rq_data_dir(req) != WRITE);
+        
+        ubd_debug("Got a write request %p (sector %llu, n_sectors %u).",
+                  req, msg.ubd_first_sector, msg.ubd_nsectors);
 
-        if (bio_data_dir(bio) == READ) {
-            msg.ubd_msgtype = UBD_MSGTYPE_READ;
-            msg.ubd_size = 0;
-        } else if ((bio->bi_rw & REQ_DISCARD) != 0) {
-            msg.ubd_msgtype = UBD_MSGTYPE_DISCARD;
-            msg.ubd_size = 0;
-        } else {
-            int n_uncopied;
+        if (write_size > msg.ubd_size) {
+            ubd_warning("Insufficient buffer space: need %u bytes; userspace "
+                        "provided only %u bytes.", write_size, msg.ubd_size);
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+            return write_size;
+        }
 
-            msg.ubd_msgtype = UBD_MSGTYPE_WRITE;
+        msg.ubd_size = msg.ubd_nsectors << 9;
+
+        // Copy the data from the write request over to the userspace buffer.
+        rq_for_each_segment(bvec, req, iter) {
+            void *src;
+            long n_uncopied;
+            unsigned int src_len;
+            unsigned long bvec_irq_flags;
+
             // Attempt to copy the bytes over.
-            msg.ubd_size = bio_cur_bytes(bio);
-            if ((n_uncopied = copy_to_user(
-                     msg.ubd_data, bio_data(bio), msg.ubd_size)) != 0)
-            {
-                ubd_warning("Failed to copy %d bytes of %u total bytes to "
-                            "userspace.", n_uncopied, msg.ubd_size);
+            src = bvec_kmap_irq(ubd_bvptr(bvec), &bvec_irq_flags);
+            src_len = ubd_bvptr(bvec)->bv_len;
+            n_uncopied = copy_to_user(dest, src, src_len);
+            bvec_kunmap_irq(src, &bvec_irq_flags);
+
+            if (n_uncopied > 0) {
+                ubd_warning("Failed to copy %ld bytes of %u total bytes to "
+                            "userspace.", n_uncopied, src_len);
                 spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
                 
-                // Indicate the size of the data buffer needed.
-                return msg.ubd_size;
+                return -EFAULT;
             }
+
+            dest += src_len;
         }
     }
 
@@ -994,21 +1015,29 @@ static long ubdctl_ioctl_getrequest(
 
     BUG_ON(tag == max_pending_reply);
     msg.ubd_tag = tag;
+    ubd_debug("Allocated tag %u.", tag);
+    ACCESS_ONCE(dev->pending_reply[tag]) = req;
+    ACCESS_ONCE(dev->n_pending_reply) = ACCESS_ONCE(dev->n_pending_reply) + 1;
     
     // Copy the message back to userspace.  If this is a write request, the
     // data has already been copied over.
     if (copy_to_user((void *) data, &msg, sizeof(msg)) != 0) {
         // Userspace became invalid?!
+        ubd_err("Userspace address %p became invalid.", (void *) data);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -EFAULT;
     }
 
-    // Dequeue this request.
+    // Remove this request from the pending delivery list.
     next_req = (struct request *) req->special;
     ACCESS_ONCE(dev->pending_delivery_head) = next_req;
+    ubd_debug("next_req = %p", next_req);
     if (next_req == NULL) {
         ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
     }
+
+    ubd_debug("Success, returning to userspace.");
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
     return 0;
 }
@@ -1025,30 +1054,30 @@ static long ubdctl_ioctl_putreply(
     ubd_bvec_iter_t bvec;
     struct req_iterator iter;
     unsigned long lock_flags;
-    uint32_t msgtype;
+    uint32_t msgtype, expected_msgtype;
     uint32_t tag;
+    uint32_t dev_status;
     int32_t status;
     uint32_t size;
     long result = -EIO;
     bool unfinished;
+    char msgbuf1[64], msgbuf2[64];
 
 #define UBD_ABORT(_result) do { result = (_result); goto done; } while (0)
 #define UBD_FINISH_ERR(_err)                                            \
     do {                                                                \
         result = 0;                                                     \
-        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);      \
+        ubd_debug("Ending request %p with error", req);                 \
         unfinished = blk_end_request_err(req, (_err));                  \
         BUG_ON(unfinished);                                             \
-        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags); \
         goto done;                                                      \
     } while (0)
 #define UBD_FINISH(_nbytes)                                             \
     do {                                                                \
         result = 0;                                                     \
-        spin_lock_irqsave(dev->in_flight->queue_lock, lock_flags);      \
+        ubd_debug("Ending request %p with success", req);               \
         unfinished = blk_end_request(req, 0, (_nbytes));                \
         BUG_ON(unfinished);                                             \
-        spin_unlock_irqrestore(dev->in_flight->queue_lock, lock_flags); \
         goto done;                                                      \
     } while (0)
 
@@ -1073,18 +1102,16 @@ static long ubdctl_ioctl_putreply(
             ubd_warning("Userspace provided data on a non-read reply.");
             UBD_ABORT(-EINVAL);
         }
-
-        if (size > UBD_MAX_DATA_SIZE) {
-            ubd_warning("Userspace attempted to return 0x%x bytes; this is "
-                        "greater than UBD_MAX_DATA_SIZE (0x%lx).",
-                        size, UBD_MAX_DATA_SIZE);
-            UBD_ABORT(-EINVAL);
-        }
     }
 
+    ubd_debug("Acquiring device lock.");
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    ubd_debug("Device lock acquired.");
+
     // If the device isn't running, just drop this.
-    if (ACCESS_ONCE(dev->status) != UBD_STATUS_RUNNING) {
+    dev_status = ACCESS_ONCE(dev->status);
+    if (dev_status == UBD_STATUS_TERMINATED) {
+        ubd_warning("Received a reply for a non-running device.");
         UBD_ABORT(-EBUSY);
     }
 
@@ -1098,79 +1125,162 @@ static long ubdctl_ioctl_putreply(
     }
 
     // Remove this reply from the list of pending replies.
+    ubd_debug("Removing request %p from the pending_reply array.", req);
     ACCESS_ONCE(dev->pending_reply[tag]) = NULL;
     ACCESS_ONCE(dev->n_pending_reply) = 
         ACCESS_ONCE(dev->n_pending_reply) - 1;
-    wake_up_locked(&dev->wait);
+    wake_up_all_locked(&dev->wait);
     spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    ubd_debug("Device lock released.");
 
-    rq_for_each_segment(bvec, req, iter) {
-        struct bio *bio = iter.bio;
-        uint32_t n_sectors = bio_sectors(bio);
-        char *buffer;
-        unsigned long copy_result;
+    // Make sure the reply type matches the request type.
+    if ((req->cmd_flags & REQ_DISCARD) != 0) {
+        expected_msgtype = UBD_MSGTYPE_DISCARD;
+    } else if ((req->cmd_flags & REQ_FLUSH) != 0) {
+        expected_msgtype = UBD_MSGTYPE_FLUSH;
+    } else if (rq_data_dir(req) == READ) {
+        expected_msgtype = UBD_MSGTYPE_READ;
+    } else {
+        expected_msgtype = UBD_MSGTYPE_WRITE;
+    }
 
-        BUG_ON(bio_segments(bio) != 1);
-        
-        if (bio_data_dir(bio) == READ) {
-            // Make sure we got a read reply.
-            if (msgtype != UBD_MSGTYPE_READ) {
-                ubd_warning("Received incompatible reply for tag %u.", tag);
-                UBD_FINISH_ERR(-EIO);
-            }
+    if (msgtype != expected_msgtype) {
+        ubd_err("Tag %u: Expected msgtype %s, got %s.", tag,
+                ubd_msgtype_to_string(expected_msgtype, msgbuf1),
+                ubd_msgtype_to_string(msgtype, msgbuf2));
+        UBD_FINISH_ERR(-EIO);
+    }
 
-            if (status < 0) {
-                // Error passthrough.
-                UBD_FINISH_ERR(status);
-            } else if (status != size || status != 512 * n_sectors) {
-                // Size is incorrect.
-                ubd_warning("Received incorrect read data size: expected "
-                            "%u bytes, received %u bytes, finished %d bytes.",
-                            512 * n_sectors, size, status);
-                UBD_FINISH_ERR(-EIO);
-            }
+    if (status < 0) {
+        // Error -- pass this back to the requester.
+        UBD_FINISH_ERR(status);
+    }
 
-            // Ok, copy the data back.
-            buffer = bvec_kmap_irq(ubd_bvptr(bvec), &lock_flags);
-            copy_result = copy_from_user(buffer, msg.ubd_data, size);
-            bvec_kunmap_irq(buffer, &lock_flags);
+    if (status != (blk_rq_sectors(req) << 9)) {
+        ubd_err("Tag %u: Status %d doesn't match request size %u.", tag,
+                status, blk_rq_sectors(req) << 9);
+        UBD_FINISH_ERR(-EIO);
+    }
 
-            if (copy_result != 0) {
-                ubd_warning("Failed to copy %lu bytes from userspace.",
-                            copy_result);
-                UBD_FINISH_ERR(-EIO);
-            } else {
-                UBD_FINISH(size);
-            }
-        } else if (
-            ((bio->bi_rw & REQ_DISCARD) != 0 &&
-             msgtype != UBD_MSGTYPE_DISCARD) ||
-            ((bio->bi_rw & REQ_DISCARD) == 0 &&
-             msgtype != UBD_MSGTYPE_WRITE))
-        {
-            ubd_warning("Received incompatible reply for tag %u.", tag);
+    if (msgtype == UBD_MSGTYPE_READ) {
+        void __user *src = msg.ubd_data;
+        uint32_t read_size = blk_rq_sectors(req) << 9;
+
+        // Make sure the sizes match.
+        if (read_size != size) {
+            ubd_err("Tag %u: Expected %u bytes in read reply, got %u.", tag,
+                    read_size, size);
             UBD_FINISH_ERR(-EIO);
-        } else {
-            if (status < 0) {
-                // Error passthrough
-                UBD_FINISH_ERR(status);
-            } else if (status != 512 * n_sectors) {
-                ubd_warning("Received incorrect write/truncate data size; "
-                            "expected %u bytes, finished %d bytes.",
-                            512 * n_sectors, status);
-                UBD_FINISH_ERR(-EIO);
-            } else {
-                UBD_FINISH(status);
-            }
         }
+
+        // Copy the data from userspace over.
+        rq_for_each_segment(bvec, req, iter) {
+            long n_uncopied;
+            unsigned long bvec_irq_flags;
+            unsigned int src_len;
+            void *dest;
+
+            dest = bvec_kmap_irq(ubd_bvptr(bvec), &bvec_irq_flags);
+            src_len = ubd_bvptr(bvec)->bv_len;
+            n_uncopied = copy_from_user(dest, src, src_len);
+            bvec_kunmap_irq(dest, &lock_flags);
+
+            if (n_uncopied > 0) {
+                ubd_warning("Failed to copy %ld bytes of %u total bytes from "
+                            "userspace.", n_uncopied, src_len);
+                UBD_FINISH_ERR(-EIO);
+            }
+
+            src += src_len;
+        }
+
+        ubd_debug("Read success.");
+        UBD_FINISH(size);
+    } else {
+        if (size != 0) {
+            ubd_err("Tag %u: Expected 0 bytes in non-read reply, got %u.", tag,
+                    size);
+            UBD_FINISH_ERR(-EIO);
+        }
+
+        UBD_FINISH(status);
     }
 
 done:
+    ubd_debug("Done.");
     return result;
 
 #undef UBD_ABORT
 #undef UBD_FINISH_ERR
 #undef UBD_FINISH
+}
+
+
+static long ubdctl_ioctl_debug(
+    struct file *filp,
+    unsigned int cmd,
+    unsigned long data)
+{
+    int devices_lock_acquired;
+    struct list_head *el;
+    
+    devices_lock_acquired = mutex_trylock(&ubd_devices_lock);
+    if (! devices_lock_acquired) {
+        ubd_warning("Failed to acquire devices lock; proceeding anyway.");
+    }
+
+    list_for_each(el, &ubd_devices) {
+        struct ublkdev *dev = list_entry(el, struct ublkdev, list);
+        int dev_lock_acquired;
+        unsigned long lock_flags;
+        uint32_t status;
+        struct gendisk *disk;
+        struct request *head, *req;
+        uint32_t n_pending_delivery = 0;
+
+        dev_lock_acquired = spin_trylock_irqsave(&dev->wait.lock, lock_flags);
+        if (! dev_lock_acquired) {
+            ubd_warning("Failed to acquire lock on device at %p; proceeding "
+                        "anyway.", dev);
+        }
+
+        status = ACCESS_ONCE(dev->status);
+        disk = ACCESS_ONCE(dev->disk);
+
+        ubd_info("Device %p: \"%s\" %s (%u)", dev,
+                 (disk != NULL ? disk->disk_name : ""),
+                 (status == UBD_STATUS_REGISTERING ? "UBD_STATUS_REGISTERING" :
+                  (status == UBD_STATUS_RUNNING ? "UBD_STATUS_RUNNING" :
+                   (status == UBD_STATUS_TERMINATED ? "UBD_STATUS_TERMINATED" :
+                    "unknown status"))), status);
+        req = head = ACCESS_ONCE(dev->pending_delivery_head);
+        while (req != NULL) {
+            n_pending_delivery++;
+            req = (struct request *) req->special;
+        }
+        ubd_info("    pending_delivery_head=%p pending_delivery_tail=%p "
+                 "n_pending_delivery=%u",
+                 head, ACCESS_ONCE(dev->pending_delivery_tail),
+                 n_pending_delivery);
+
+
+        ubd_info("    n_pending_reply=%u max_pending_reply=%u",
+                 ACCESS_ONCE(dev->n_pending_reply),
+                 ACCESS_ONCE(dev->max_pending_reply));
+        ubd_info("    n_control_handles=%u n_block_handles=%u",
+                 ACCESS_ONCE(dev->n_control_handles),
+                 ACCESS_ONCE(dev->n_block_handles));
+        
+        if (dev_lock_acquired) {
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        }
+    }
+
+    if (devices_lock_acquired) {
+        mutex_unlock(&ubd_devices_lock);
+    }
+
+    return 0;
 }
 
 
@@ -1211,7 +1321,7 @@ static int ubdblk_open(struct block_device *blkdev, fmode_t mode) {
     }
 
     ACCESS_ONCE(dev->n_block_handles) = ACCESS_ONCE(dev->n_block_handles) + 1;
-    wake_up_locked(&dev->wait);
+    wake_up_all_locked(&dev->wait);
     spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
     ubd_debug("Device opened.");
@@ -1242,7 +1352,7 @@ static void ubdblk_release(struct gendisk *disk, fmode_t mode) {
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         ubd_free_ublkdev(dev);
     } else {
-        wake_up_locked(&dev->wait);
+        wake_up_all_locked(&dev->wait);
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
 
@@ -1278,15 +1388,17 @@ static void ubdblk_add_disk(struct work_struct *work) {
     unsigned long lock_flags;
     uint32_t status;
 
-    printk(KERN_DEBUG "[%d] ubdblk_add_disk: dev=%p\n", current->pid, dev);
     BUG_ON(dev == NULL);
 
     /* Go from registering to running+adding */
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
+    ubd_debug("disk name: \"%s\".", ACCESS_ONCE(dev->disk)->disk_name);
     status = ACCESS_ONCE(dev->status);
     BUG_ON(status != UBD_STATUS_REGISTERING);
     ACCESS_ONCE(dev->status) = UBD_STATUS_RUNNING;
-    wake_up_locked(&dev->wait);
+
+    ubd_debug("Notifying waiters of status change.");
+    wake_up_all_locked(&dev->wait);
     spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
     /* Add the disk to the system. */
@@ -1311,8 +1423,9 @@ static void ubdblk_handle_request(struct request_queue *rq) {
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         status = dev->status;
 
-        if (unlikely(status != UBD_STATUS_RUNNING)) {
+        if (unlikely(status == UBD_STATUS_TERMINATED)) {
             // Device is not running; fail the request.
+            ubd_warning("Received a request for a non-running device.");
             unfinished = blk_end_request_err(req, -EIO);
             BUG_ON(unfinished);
         } else {
@@ -1344,15 +1457,19 @@ static void ubdblk_handle_fs_request(
     BUG_ON(dev == NULL);
     BUG_ON(req == NULL);
 
+    ubd_debug("Adding filesystem request %p to tail.", req);
     tail = ACCESS_ONCE(dev->pending_delivery_tail);
 
     ACCESS_ONCE(dev->pending_delivery_tail) = req;
     if (tail == NULL) {
         ACCESS_ONCE(dev->pending_delivery_head) = req;
+    } else {
+        tail->special = req;
     }
 
     req->special = NULL;
-    wake_up_locked(&dev->wait);
+    ubd_debug("Notifying waiters of new request.");
+    wake_up_all_locked(&dev->wait);
     return;
 }
 

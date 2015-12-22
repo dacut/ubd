@@ -37,6 +37,9 @@
 /** ioctl: put reply. */
 #define UBD_IOCPUTREPLY     _IOW(UBD_IOC_MAGIC, 0xa6, struct ubd_message)
 
+/** ioctl: print debugging information. */
+#define UBD_IOCDEBUG        _IO(UBD_IOC_MAGIC, 0xa7)
+
 /** ubd_flags: device is read only. */
 #define UBD_FL_READ_ONLY    0x00000001
 
@@ -77,8 +80,8 @@ struct ubd_describe {
 /** ubd_msgtype code for a discard (trim) request. */
 #define UBD_MSGTYPE_DISCARD                 2
 
-/** Maximum size of UBD data in a request or reply. */
-#define UBD_MAX_DATA_SIZE             	    ((size_t) (4 << 20))   /* 4 MB */
+/** ubd_msgtype code for a flush request. */
+#define UBD_MSGTYPE_FLUSH                   3
 
 /** UBD request / reply
  *  
