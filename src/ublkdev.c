@@ -930,6 +930,10 @@ static long ubdctl_ioctl_getrequest(
         return -EFAULT;
     }
 
+    ubd_debug("msg: msgtype=%u tag=%u nsect=%u first=%llu size=%u data=%p",
+              msg.ubd_msgtype, msg.ubd_tag, msg.ubd_nsectors,
+              msg.ubd_first_sector, msg.ubd_size, msg.ubd_data);
+
     // Wait for a message to become available *and* a tag slot to become
     // available.
     ubd_debug("Will wait for a message to appear.");
@@ -947,21 +951,23 @@ static long ubdctl_ioctl_getrequest(
 
     msg.ubd_nsectors = blk_rq_sectors(req);
     msg.ubd_first_sector = blk_rq_pos(req);
-    msg.ubd_size = 0;
 
     // Fill in the remaining details.
     if ((req->cmd_flags & REQ_DISCARD) != 0) {
         ubd_debug("Got a discard request %p (sector %llu, n_sectors %u).",
                   req, msg.ubd_first_sector, msg.ubd_nsectors);
         msg.ubd_msgtype = UBD_MSGTYPE_DISCARD;
+        msg.ubd_size = 0;
     } else if ((req->cmd_flags & REQ_FLUSH) != 0) {
         ubd_debug("Got a flush request %p (sector %llu, n_sectors %u).",
                   req, msg.ubd_first_sector, msg.ubd_nsectors);
         msg.ubd_msgtype = UBD_MSGTYPE_FLUSH;
+        msg.ubd_size = 0;
     } else if (rq_data_dir(req) == READ) {
         ubd_debug("Got a read request %p (sector %llu, n_sectors %u).",
                   req, msg.ubd_first_sector, msg.ubd_nsectors);
         msg.ubd_msgtype = UBD_MSGTYPE_READ;
+        msg.ubd_size = 0;
     } else {
         void __user *dest = msg.ubd_data;
         uint32_t write_size = msg.ubd_nsectors << 9;
@@ -978,6 +984,7 @@ static long ubdctl_ioctl_getrequest(
             return write_size;
         }
 
+        msg.ubd_msgtype = UBD_MSGTYPE_WRITE;
         msg.ubd_size = msg.ubd_nsectors << 9;
 
         // Copy the data from the write request over to the userspace buffer.

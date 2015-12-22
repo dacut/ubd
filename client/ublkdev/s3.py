@@ -14,6 +14,7 @@ from six.moves import cStringIO as StringIO
 from struct import pack, unpack
 from sys import argv, exit, stderr, stdin, stdout
 from threading import Condition, Lock, Thread
+from time import sleep
 from .ublkdev import (
     UBD_MSGTYPE_READ, UBD_MSGTYPE_WRITE, UBD_MSGTYPE_DISCARD,
     UBDMessage, UserBlockDevice)
@@ -34,22 +35,51 @@ class UBDS3Handler(Thread):
     def __init__(self, name, volume):
         super(UBDS3Handler, self).__init__(name=name)
         self.volume = volume
+        self.ubd = UserBlockDevice()
+        self.ubd.tie(volume.major)
         self.bucket = volume.s3.get_bucket(volume.bucket_name)
+        self.buffer = create_string_buffer(4 << 20)
         return
 
     def run(self):
         volume = self.volume
 
         while not volume.stop_requested:
-            with volume.request_lock:
-                try:
-                    request, buf = volume.request_queue.pop()
-                except IndexError:
-                    volume.request_lock.wait(1)
-                    continue
-            
-            volume.handle_ubd_request(self.bucket, request, buf)
+            request = self.ubd.get_request(self.buffer)
+            self.handle_ubd_request(self.bucket, request, self.buffer)
         return
+
+    def handle_ubd_request(self, bucket, msg, buf):
+        """
+        s3handler.handle_ubd_request(bucket, ubd_request)
+        """
+        req_type = msg.ubd_msgtype
+        req_tag = msg.ubd_tag
+        offset = 512 * msg.ubd_first_sector
+        length = 512 * msg.ubd_nsectors
+
+        try:
+            if req_type == UBD_MSGTYPE_READ:
+                buf[:length] = self.volume.read(bucket, offset, length)
+                msg.ubd_size = length
+                msg.ubd_status = length
+            elif req_type == UBD_MSGTYPE_WRITE:
+                log.debug("write offset=%d length=%d", offset, length)
+                self.volume.write(bucket, offset, buf.raw[:length])
+                msg.ubd_size = 0
+                msg.ubd_status = length
+            elif req_type == UBD_MSGTYPE_DISCARD:
+                log.debug("trim offset=%d length=%d", offset, length)
+                self.volume.trim(bucket, offset, length)
+                msg.ubd_size = 0
+                msg.ubd_status = length
+        except OSError as e:
+            reply_status = -e.errno
+
+        self.ubd.put_reply(msg)
+        return
+# end UBDS3Handler
+
 
 class UBDS3Volume(object):
     def __init__(self, bucket_name, devname, region, n_threads=1, **kw):
@@ -72,9 +102,7 @@ class UBDS3Volume(object):
         self.storage_class = None
         self.suffix = None
 
-        self.request_queue = []
         self.buffers_lock = Lock()
-        self.request_lock = Condition()
         self.stop_requested = False
         return
 
@@ -89,7 +117,7 @@ class UBDS3Volume(object):
 
         self.ubd = UserBlockDevice()
         info = self.ubd.register(self.devname, n_sectors)
-        self.ubd.tie(info.ubd_major)
+        self.major = info.ubd_major
         return
 
     def run(self):
@@ -102,16 +130,7 @@ class UBDS3Volume(object):
                 thread.start()
 
             while not self.stop_requested:
-                with self.buffers_lock:
-                    try:
-                        buf = self.buffers.pop()
-                    except IndexError:
-                        buf = create_string_buffer(4 << 20)
-
-                request = self.ubd.get_request(buf)
-                with self.request_lock:
-                    self.request_queue.append((request, buf))
-                    self.request_lock.notify()
+                sleep(30)
         finally:
             self.stop_requested = True
             for thread in self.threads:
@@ -167,39 +186,6 @@ class UBDS3Volume(object):
         self.size = size
         self.storage_class = storage_class
         self.suffix = suffix
-        return
-
-    def handle_ubd_request(self, bucket, msg, buf):
-        """
-        s3handler.handle_ubd_request(bucket, ubd_request)
-        """
-        req_type = msg.ubd_msgtype
-        req_tag = msg.ubd_tag
-        offset = 512 * msg.ubd_first_sector
-        length = 512 * msg.ubd_nsectors
-
-        try:
-            if req_type == UBD_MSGTYPE_READ:
-                buf[:length] = self.read(bucket, offset, length)
-                msg.ubd_size = length
-                msg.ubd_status = length
-            elif req_type == UBD_MSGTYPE_WRITE_REQUEST:
-                log.debug("write offset=%d length=%d", offset, length)
-                self.write(bucket, offset, buf.raw[:length])
-                msg.ubd_size = 0
-                msg.ubd_status = length
-            elif req_type == UBD_MSGTYPE_DISCARD_REQUEST:
-                log.debug("trim offset=%d length=%d", offset, length)
-                self.trim(bucket, offset, length)
-                msg.ubd_size = 0
-                msg.ubd_status = length
-        except OSError as e:
-            reply_status = -e.errno
-
-        self.ubd.put_reply(msg)
-        with self.buffers_lock:
-            self.buffers.append(buf)
-            
         return
 
     def read(self, bucket, offset, length):
@@ -385,7 +371,6 @@ class UBDS3Volume(object):
             pass
 
         return
-
                 
 
 def parse_size(value, parameter_name, min=0, max=None):

@@ -2,11 +2,14 @@ from __future__ import absolute_import, print_function
 from cStringIO import StringIO
 import ctypes
 import fcntl
+import logging
 import os
 import select
 import struct
 import sys
 from .ioctl import _IO, _IOR, _IOW, _IOWR
+
+log = logging.getLogger("ubddev.ubddev")
 
 UBD_DISK_NAME_LEN = 32
 
@@ -43,6 +46,11 @@ class UBDMessage(ctypes.Structure):
         ("ubd_size", ctypes.c_uint32),
         ("ubd_data", ctypes.c_char_p),
     ]
+
+    def __str__(self):
+        return "[msgtype=%s tag=%d secstat=%d first=%d size=%d data=%s]" % (
+            self.ubd_msgtype, self.ubd_tag, self.ubd_status,
+            self.ubd_first_sector, self.ubd_size, self.ubd_data)
 
 UBD_MSGTYPE_READ = 0
 UBD_MSGTYPE_WRITE = 1
@@ -111,10 +119,14 @@ class UserBlockDevice(object):
         msg = UBDMessage()
         msg.ubd_size = len(buf)
         msg.ubd_data = ctypes.cast(buf, ctypes.c_char_p)
+        assert msg.ubd_size != 0
+        log.debug("get_request: tx %s", msg)
         fcntl.ioctl(self.control, UBD_IOCGETREQUEST, msg)
+        log.debug("get_request: rx %s", msg)
         return msg
 
     def put_reply(self, msg):
+        log.debug("put_reply: %s", msg)
         fcntl.ioctl(self.control, UBD_IOCPUTREPLY, msg)
         return
 
