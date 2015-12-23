@@ -120,13 +120,10 @@ class UserBlockDevice(object):
         msg.ubd_size = len(buf)
         msg.ubd_data = ctypes.cast(buf, ctypes.c_char_p)
         assert msg.ubd_size != 0
-        log.debug("get_request: tx %s", msg)
         fcntl.ioctl(self.control, UBD_IOCGETREQUEST, msg)
-        log.debug("get_request: rx %s", msg)
         return msg
 
     def put_reply(self, msg):
-        log.debug("put_reply: %s", msg)
         fcntl.ioctl(self.control, UBD_IOCPUTREPLY, msg)
         return
 

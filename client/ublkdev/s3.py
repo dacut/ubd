@@ -45,8 +45,10 @@ class UBDS3Handler(Thread):
         volume = self.volume
 
         while not volume.stop_requested:
-            request = self.ubd.get_request(self.buffer)
-            self.handle_ubd_request(self.bucket, request, self.buffer)
+            ready_list = self.ubd.in_poll.poll(100)
+            if ready_list:
+                request = self.ubd.get_request(self.buffer)
+                self.handle_ubd_request(self.bucket, request, self.buffer)
         return
 
     def handle_ubd_request(self, bucket, msg, buf):
@@ -64,12 +66,10 @@ class UBDS3Handler(Thread):
                 msg.ubd_size = length
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_WRITE:
-                log.debug("write offset=%d length=%d", offset, length)
                 self.volume.write(bucket, offset, buf.raw[:length])
                 msg.ubd_size = 0
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_DISCARD:
-                log.debug("trim offset=%d length=%d", offset, length)
                 self.volume.trim(bucket, offset, length)
                 msg.ubd_size = 0
                 msg.ubd_status = length
@@ -132,6 +132,7 @@ class UBDS3Volume(object):
             while not self.stop_requested:
                 sleep(30)
         finally:
+            log.debug("Stop requested.")
             self.stop_requested = True
             for thread in self.threads:
                 thread.join()
