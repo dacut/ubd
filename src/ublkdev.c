@@ -474,24 +474,26 @@ static unsigned int ubdctl_poll(struct file *filp, poll_table *wait) {
     } else {
         unsigned long lock_flags;
         uint32_t status;
+        wait_queue_head_t *wq;
+        struct request *pending_delivery;
 
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         status = ACCESS_ONCE(dev->status);
-
-        poll_wait(filp, &dev->wait, wait);
+        wq = &dev->wait;
+        pending_delivery = ACCESS_ONCE(dev->pending_delivery_head);
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
 
         if (status == UBD_STATUS_RUNNING) {
+            poll_wait(filp, wq, wait);
             result |= POLLOUT | POLLWRNORM;
             
-            if (dev->pending_delivery_head != NULL) {
+            if (pending_delivery != NULL) {
                 result |= POLLIN | POLLRDNORM;
             }
         } else if (status == UBD_STATUS_TERMINATED) {
             /* Device is being torn down. */
             result |= POLLHUP;
         }
-
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
 
     return result;
@@ -503,9 +505,6 @@ static long ubdctl_ioctl(
     unsigned int cmd,
     unsigned long data)
 {
-    printk(KERN_DEBUG "[%d] ubdctl_ioctl: ioctl(%u, 0x%lx)\n",
-           current->pid, cmd, data);
-
     switch (cmd) {
     case UBD_IOCREGISTER:
         return ubdctl_ioctl_register(filp, cmd, data);
