@@ -287,14 +287,14 @@ class UBDS3Volume(object):
         """
         Convert a block index to an S3 key prefix.
         """
-        return b64encode(pack("<Q", block_index))[:-1]
+        return b64encode(pack("<Q", block_index))
 
     @staticmethod
     def prefix_to_block(prefix):
         """
         Convert an S3 key prefix to a block index.
         """
-        return unpack("<Q", b64decode(prefix + "="))[0]
+        return unpack("<Q", b64decode(prefix))[0]
 
     def get_key_for_block(self, bucket, block_id):
         """
