@@ -86,10 +86,8 @@ class UBDS3Volume(object):
         super(UBDS3Volume, self).__init__()
         self.bucket_name = bucket_name
         self.devname = devname
-        self.s3 = boto.s3.connect_to_region(region, **kw)
-        if self.s3 is None:
-            raise RuntimeError("Failed to connect to S3 region %r" % region)
-
+        self.region = region
+        self.s3_kw = kw
         self.ubd = None
         self.n_threads = n_threads
         self.buffers = [create_string_buffer(4 << 20)
@@ -105,6 +103,13 @@ class UBDS3Volume(object):
         self.buffers_lock = Lock()
         self.stop_requested = False
         return
+
+    @property
+    def s3(self):
+        s3 = boto.s3.connect_to_region(self.region, **self.s3_kw)
+        if s3 is None:
+            raise RuntimeError("Failed to connect to S3 region %r" % region)
+        return s3
 
     def register(self):
         """
