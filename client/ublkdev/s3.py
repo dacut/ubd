@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 from __future__ import absolute_import, division, print_function
-from base64 import b64decode, b64encode
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from boto.exception import S3ResponseError
 import boto.s3
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import create_string_buffer
 from errno import EIO
 from getopt import getopt, GetoptError
 from json import dumps as json_dumps, loads as json_loads
 import logging
 from os import environ
+from pylru import WriteThroughCacheManager
 from re import match
 from six.moves import cStringIO as StringIO
 from struct import pack, unpack
 from sys import argv, exit, stderr, stdin, stdout
-from threading import Condition, Lock, Thread
+from threading import Condition, RLock, Thread
 from time import sleep
 from .ublkdev import (
     UBD_MSGTYPE_READ, UBD_MSGTYPE_WRITE, UBD_MSGTYPE_DISCARD,
@@ -37,7 +39,6 @@ class UBDS3Handler(Thread):
         self.volume = volume
         self.ubd = UserBlockDevice()
         self.ubd.tie(volume.major)
-        self.bucket = volume.s3.get_bucket(volume.bucket_name)
         self.buffer = create_string_buffer(4 << 20)
         return
 
@@ -48,12 +49,12 @@ class UBDS3Handler(Thread):
             ready_list = self.ubd.in_poll.poll(100)
             if ready_list:
                 request = self.ubd.get_request(self.buffer)
-                self.handle_ubd_request(self.bucket, request, self.buffer)
+                self.handle_ubd_request(request, self.buffer)
         return
 
-    def handle_ubd_request(self, bucket, msg, buf):
+    def handle_ubd_request(self, msg, buf):
         """
-        s3handler.handle_ubd_request(bucket, ubd_request)
+        s3handler.handle_ubd_request(ubd_request, buffer)
         """
         req_type = msg.ubd_msgtype
         req_tag = msg.ubd_tag
@@ -62,15 +63,15 @@ class UBDS3Handler(Thread):
 
         try:
             if req_type == UBD_MSGTYPE_READ:
-                buf[:length] = self.volume.read(bucket, offset, length)
+                buf[:length] = self.volume.read(offset, length)
                 msg.ubd_size = length
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_WRITE:
-                self.volume.write(bucket, offset, buf.raw[:length])
+                self.volume.write(offset, buf.raw[:length])
                 msg.ubd_size = 0
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_DISCARD:
-                self.volume.trim(bucket, offset, length)
+                self.volume.trim(offset, length)
                 msg.ubd_size = 0
                 msg.ubd_status = length
         except OSError as e:
@@ -80,19 +81,78 @@ class UBDS3Handler(Thread):
         return
 # end UBDS3Handler
 
+class S3Pool(object):
+    def __init__(self, region, size, bucket_name, s3_kw={}):
+        super(S3Pool, self).__init__()
+        conns = [boto.s3.connect_to_region(region, **s3_kw)
+                 for i in xrange(size)]
+        if [conn for conn in conns if conn is None]:
+            raise RuntimeError("Failed to connect to S3 region %r" % region)
+        self.connections = [
+            S3PoolConnection(self, conn, bucket_name) for conn in conns]
+        self.lock = Condition()
+        return
 
+    def get_connection(self, timeout=None):
+        with self.lock:
+            while True:
+                try:
+                    return self.connections.pop()
+                except IndexError:
+                    self.lock.wait(timeout)
+    
+    def return_connection(self, conn):
+        with self.lock:
+            self.connections.append(conn)
+            self.lock.notify()
+
+class S3PoolConnection(object):
+    def __init__(self, pool, s3, bucket_name):
+        super(S3PoolConnection, self).__init__()
+        self.pool = pool
+        self.s3 = s3
+        self.bucket = self.s3.get_bucket(bucket_name)
+        return
+
+    def __getattr__(self, name):
+        return getattr(self.s3, name)
+    
+    def __setattr__(self, name, value):
+        if name in ('pool', 's3', 'bucket'):
+            self.__dict__[name] = value
+        else:
+            setattr(self.s3, name, value)
+
+    def __delattr__(self, name):
+        if name in ('pool', 's3', 'bucket'):
+            del self.__dict__[name]
+        else:
+            return delattr(self.s3, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.pool.return_connection(self)
+        
 class UBDS3Volume(object):
-    def __init__(self, bucket_name, devname, region, n_threads=1, **kw):
+    """
+    A userspace block driver volume handler for S3-backed volumes.
+    """
+    def __init__(self, bucket_name, devname, region, handler_threads=1,
+                 write_threads=10, cache_size=1000000, s3_kw={}):
+        """
+        UBDS3Volume(bucket_name, devname, region, handler_threads=1,
+                    write_threads=10, cache_size=1000000, s3_kw={})
+              
+        Create a new UBDS3Volume object.
+        """
         super(UBDS3Volume, self).__init__()
         self.bucket_name = bucket_name
         self.devname = devname
         self.region = region
-        self.s3_kw = kw
         self.ubd = None
-        self.n_threads = n_threads
-        self.buffers = [create_string_buffer(4 << 20)
-                        for i in xrange(2 * n_threads)]
-
+        self.handler_threads = handler_threads
         self.block_size = None
         self.encryption = None
         self.policy = None
@@ -100,16 +160,20 @@ class UBDS3Volume(object):
         self.storage_class = None
         self.suffix = None
 
-        self.buffers_lock = Lock()
         self.stop_requested = False
-        return
 
-    @property
-    def s3(self):
-        s3 = boto.s3.connect_to_region(self.region, **self.s3_kw)
-        if s3 is None:
-            raise RuntimeError("Failed to connect to S3 region %r" % region)
-        return s3
+        self.s3_pool = S3Pool(region, handler_threads + write_threads,
+                              bucket_name, s3_kw)
+
+        self.lock = RLock()
+
+        # lock must be held to read or write lrucache and pending_write
+        self.lrucache = WriteThroughCacheManager(self, cache_size)
+        self.pending_write = {}
+
+        self.write_executor = ThreadPoolExecutor(write_threads)
+
+        return
 
     def register(self):
         """
@@ -127,7 +191,7 @@ class UBDS3Volume(object):
 
     def run(self):
         self.threads = [UBDS3Handler("handler-%d" % i, self)
-                        for i in xrange(self.n_threads)]
+                        for i in xrange(self.handler_threads)]
 
         try:
             for thread in self.threads:
@@ -142,22 +206,26 @@ class UBDS3Volume(object):
             for thread in self.threads:
                 thread.join()
 
+            self.write_executor.shutdown()
+
         return
         
     def read_volume_info(self):
         """
         Read the devname.volinfo file in the S3 bucket.
         """
-        bucket = self.s3.get_bucket(self.bucket_name)
-        key = bucket.get_key(self.devname + ".volinfo")
-        config = json_loads(key.get_contents_as_string())
+        with self.s3_pool.get_connection() as s3:
+            bucket = s3.get_bucket(self.bucket_name)
+            key = bucket.get_key(self.devname + ".volinfo")
+            config = json_loads(key.get_contents_as_string())
 
-        self.block_size = int(config.get("block-size", 4096))
-        self.encryption = config.get("encryption")
-        self.policy = config.get("policy", "private")
-        self.size = int(config.get("size"))
-        self.storage_class = config.get("storage_class", "standard")
-        self.suffix = config.get("suffix", "." + self.devname)
+            self.block_size = int(config.get("block-size", 4096))
+            self.encryption = config.get("encryption")
+            self.policy = config.get("policy", "private")
+            self.size = int(config.get("size"))
+            self.storage_class = config.get("storage_class", "standard")
+            self.suffix = config.get("suffix", "." + self.devname)
+
         return
 
     def create_volume(self, block_size=4096, encryption="",
@@ -166,37 +234,40 @@ class UBDS3Volume(object):
         """
         Create the volume in the S3 bucket.
         """
-        bucket = self.s3.get_bucket(self.bucket_name)
-        key = bucket.new_key(self.devname + ".volinfo")
+        with self.s3_pool.get_connection() as s3:
+            bucket = s3.get_bucket(self.bucket_name)
+            key = bucket.new_key(self.devname + ".volinfo")
 
-        if size is None:
-            raise ValueError("size must be specified")
+            if size is None:
+                raise ValueError("size must be specified")
 
-        config = {
-            'block-size': block_size,
-            'policy': policy,
-            'size': size,
-            'storage-class': storage_class
-        }
+            config = {
+                'block-size': block_size,
+                'policy': policy,
+                'size': size,
+                'storage-class': storage_class
+            }
 
-        if encryption:
-            config['encryption'] = encryption
+            if encryption:
+                config['encryption'] = encryption
 
-        if suffix:
-            config['suffix'] = suffix
+            if suffix:
+                config['suffix'] = suffix
 
-        key.set_contents_from_string(json_dumps(config), policy=self.policy)
-        self.block_size = block_size
-        self.encryption = encryption
-        self.policy = policy
-        self.size = size
-        self.storage_class = storage_class
-        self.suffix = suffix
+            key.set_contents_from_string(
+                json_dumps(config), policy=self.policy)
+            self.block_size = block_size
+            self.encryption = encryption
+            self.policy = policy
+            self.size = size
+            self.storage_class = storage_class
+            self.suffix = suffix
+
         return
 
-    def read(self, bucket, offset, length):
+    def read(self, offset, length):
         """
-        s3handler.read(bucket, offset, length) -> str
+        s3handler.read(offset, length) -> str
 
         Read data from this volume from offset to offset + length.
         """
@@ -209,7 +280,7 @@ class UBDS3Volume(object):
 
         result = StringIO()
         for block_id in xrange(start_block, end_block + 1):
-            block_data = self.read_block(bucket, block_id)
+            block_data = self.read_block(block_id)
             
             if block_id == start_block:
                 # Trim the data to omit anything from before the start of the
@@ -226,9 +297,9 @@ class UBDS3Volume(object):
 
         return result.getvalue()
 
-    def write(self, bucket, offset, data):
+    def write(self, offset, data):
         """
-        s3handler.write(bucket, offset, data)
+        s3handler.write(offset, data)
 
         Write data to this volume starting at offset.
         """
@@ -246,7 +317,7 @@ class UBDS3Volume(object):
                 (block_id == end_block and
                  end_offset != self.block_size)):
                 # Yes; get the existing data.
-                block_data = self.read_block(bucket, block_id)
+                block_data = self.read_block(block_id)
                     
                 # Splice in the current data.
                 start_pos = (0 if block_id != start_block else start_offset)
@@ -260,16 +331,16 @@ class UBDS3Volume(object):
             else:
                 block_data = to_write.read(self.block_size)
 
-            self.write_block(bucket, block_id, block_data)
+            self.write_block(block_id, block_data)
 
         return
 
-    def trim(self, bucket, offset, length):
+    def trim(self, offset, length):
         """
         s3handler.trim(bucket, offset, length)
 
         Trim any full blocks of data from this volume starting at offset and
-        extending to offset + length
+        extending to offset + length.
         """
         start_block, start_offset = divmod(offset, self.block_size)
         end_block, end_offset = divmod(offset + len(data), self.block_size)
@@ -283,7 +354,7 @@ class UBDS3Volume(object):
             # Skip partial blocks
             if ((block_id != start_block or start_offset == 0) and
                 (block_id != end_block or end_offset == self.block_size)):
-                self.trim_block(bucket, block_id)
+                self.trim_block(block_id)
 
         return
 
@@ -292,14 +363,10 @@ class UBDS3Volume(object):
         """
         Convert a block index to an S3 key prefix.
         """
-        return b64encode(pack("<Q", block_index))
-
-    @staticmethod
-    def prefix_to_block(prefix):
-        """
-        Convert an S3 key prefix to a block index.
-        """
-        return unpack("<Q", b64decode(prefix))[0]
+        result = urlsafe_b64encode(pack("<Q", block_index))
+        assert len(result) == 12
+        assert result[-1] == '='
+        return result[:-1]
 
     def get_key_for_block(self, bucket, block_id):
         """
@@ -311,73 +378,133 @@ class UBDS3Volume(object):
         key_name = UBDS3Volume.block_to_prefix(block_id) + self.suffix
         return bucket.new_key(key_name)
 
-    def read_block(self, bucket, block_id):
+    def read_block(self, block_id):
         """
         s3handler.read_block(bucket, block_id) -> str
 
         Read a block of data.  The bucket must be a Boto S3 object; this is
         required for thread safety.
         """
-        key = self.get_key_for_block(bucket, block_id)
+        with self.lock:
+            result = self.pending_write.get(block_id)
+            if result is not None:
+                return result
 
-        try:
-            block_data = key.read()
-            if len(block_data) != self.block_size:
-                raise OSError(
-                    EIO, "Failed to read block %d: block truncated at %d "
-                    "bytes instead of %d bytes" % (block_id, len(block_data),
-                                                   self.block_size))
-        except S3ResponseError as e:
-            if e.status == 404:
-                block_data = b"\0" * self.block_size
-            else:
-                raise OSError(EIO, str(e))
+            result = self.lrucache.get(block_id)
+            if result == "":
+                # Trimmed block
+                result = "\0" * self.block_size
+            return result
 
-        return block_data
-
-    def write_block(self, bucket, block_id, block_data):
+    def write_block(self, block_id, block_data):
         """
         s3handler.write_block(bucket, block_id, block_data)
         
         Write a block of data.  The bucket must be a Boto S3 object; this is
         required for thread safety.
         """
-        key = self.get_key_for_block(bucket, block_id)
+        with self.lock:
+            self.lrucache[block_id] = block_data
 
-        if len(block_data) != self.block_size:
-            raise OSError(
-                EIO, "Failed to write block %d: block truncated at %d bytes "
-                "instead of %d bytes" % (block_id, len(block_data),
-                                         self.block_size))
+    def trim_block(self, block_id):
+        with self.lock:
+            self.lrucache[block_id] = "\0" * block_size
 
-        rr = (self.storage_class == 'reduced-redundancy')
-        encrypt_key = (self.encryption == "sse-s3")
-        
-        try:
-            key.set_contents_from_string(
-                block_data, reduced_redundancy=rr, policy=self.policy,
-                encrypt_key=encrypt_key)
-        except S3ResponseError as e:
-            raise OSError(EIO, str(e))
+    def read_block_from_s3(self, block_id):
+        with self.s3_pool.get_connection() as s3:
+            key = self.get_key_for_block(s3.bucket, block_id)
+            sleep_time = 0.1
 
-        return
+            while True:
+                try:
+                    block_data = key.read()
+                    if len(block_data) != self.block_size:
+                        raise OSError(
+                            EIO, "Failed to read block %d: block truncated "
+                            "at %d bytes instead of %d bytes" % (
+                                block_id, len(block_data), self.block_size))
+                    return block_data
+                except S3ResponseError as e:
+                    if e.status == 404:
+                        return b"\0" * self.block_size
+                    elif e.status < 500:
+                        log.warning("Received unexpected S3 error: %s", e,
+                                    exc_info=True)
+                        raise OSError(EIO, str(e))
+                    log.info("S3 temporarily unavailable (%d): %s; still "
+                             "trying", e.status, e)
+                except EnvironmentError as e:
+                    log.info("S3 temporarily unavailable (env): %s; still "
+                             "trying", e)
 
-    def trim_block(self, bucket, block_id):
-        """
-        s3handler.write_block(bucket, block_id, block_data)
-        
-        Trim a block of data.  The bucket must be a Boto S3 object; this is
-        required for thread safety.
-        """
-        key = self.get_key_for_block(bucket, block_id)
+                sleep(sleep_time)
+                sleep_time = min(5.0, 1.5 * sleep_time)
 
-        try:
-            key.delete()
-        except S3ResponseError as e:
-            pass
+    def schedule_block_write(self, block_id, block_data):
+        self.write_executor.submit(self.async_write_block_to_s3, block_id,
+                                   block_data)
+        self.pending_write[block_id] = block_data
 
-        return
-                
+    def async_write_block_to_s3(self, block_id):
+        with self.lock:
+            block_data = self.pending_write.get(block_id)
+            if block_data is None:
+                # Multiple write to the same block; we've already written the
+                # newer data.
+                return
+
+        with self.s3_pool.get_connection() as s3:
+            key = self.get_key_for_block(s3.bucket, block_id)
+
+            if len(block_data) != self.block_size:
+                raise OSError(
+                    EIO, "Failed to write block %d: block truncated at %d "
+                    "bytes instead of %d bytes" % (block_id, len(block_data),
+                                                   self.block_size))
+
+            rr = (self.storage_class == 'reduced-redundancy')
+            encrypt_key = (self.encryption == "sse-s3")
+            sleep_time = 0.1
+
+            while True:
+                try:
+                    if block_data != "\0" * self.block-size:
+                        # Trim empty blocks
+                        key.delete()
+                    else:
+                        key.set_contents_from_string(
+                            block_data, reduced_redundancy=rr,
+                            policy=self.policy, encrypt_key=encrypt_key)
+
+                    with self.lock:
+                        del self.pending_write[block_id]
+
+                    return
+                except S3ResponseError as e:
+                    if e.status < 500:
+                        log.warning("Received unexpected S3 error: %s", e,
+                                    exc_info=True)
+                        raise OSError(EIO, str(e))
+                    log.info("S3 temporarily unavailable (%d): %s; still "
+                             "trying", e.status, e)
+                except EnvironmentError as e:
+                    log.info("S3 temporarily unavailable (env): %s; still "
+                             "trying", e)
+
+                sleep(sleep_time)
+                sleep_time = min(5.0, 1.5 * sleep_time)
+
+    def __getitem__(self, block_id):
+        # Called by WriteThroughCacheManager
+        return self.read_block_from_s3(block_id)
+
+    def __setitem__(self, block_id, block_data):
+        # Called by WriteThroughCacheManager
+        return self.schedule_block_write(block_id, block_data)
+
+    def __contains__(self, block_id):
+        # Called by WriteThroughCacheManager
+        return 0 <= block_id < (self.size // self.block_size)
 
 def parse_size(value, parameter_name, min=0, max=None):
     m = match(r"([0-9]+|0x[0-9a-fA-F]+)\s*"
@@ -385,10 +512,10 @@ def parse_size(value, parameter_name, min=0, max=None):
     if not m:
         raise GetoptError("Invalid %s value: %r" % (parameter_name, value))
     
-    result = int(value[0])
-    suffix = value[1][0]
+    result = int(m.group(1))
+    suffix = m.group(2)
     if suffix:
-        result <<= suffix_shift[suffix]
+        result <<= suffix_shift[suffix[0]]
     
     if min is not None and result < min:
         raise ValueError("Invalid %s value (must be at least %d): %r" %
@@ -407,7 +534,8 @@ def main(args=None):
     proxy_user = environ.get("PROXY_USER")
     proxy_password = environ.get("PROXY_PASSWORD")
     create = False
-    threads = 4
+    handler_threads = 1
+    write_threads = 10
 
     if args is None:
         args = argv[1:]
@@ -420,9 +548,10 @@ def main(args=None):
     try:
         opts, args = getopt(args, "b:B:cC:e:hp:P:r:s:S:t:",
                             ["bucket=", "block-size=", "create", "encryption=",
-                             "help", "policy=", "profile=", "proxy-user=",
-                             "proxy-password=", "proxy-port=", "region=",
-                             "size=", "storage-class=", "suffix=", "threads="])
+                             "handler-threads=", "help", "policy=",
+                             "profile=", "proxy-user=", "proxy-password=",
+                             "proxy-port=", "region=", "size=",
+                             "storage-class=", "suffix=", "write-threads="])
 
         for opt, value in opts:
             if opt in ("--bucket", "-b",):
@@ -437,6 +566,8 @@ def main(args=None):
                 if encryption != "sse-s3":
                     raise ValueError(
                         "Invalid encryption specification: %r" % value)
+            elif opt in ("--handler-threads",):
+                handler_threads = int(value)
             elif opt in ("--help", "-h",):
                 usage(stdout)
                 return 0
@@ -470,8 +601,8 @@ def main(args=None):
                     raise ValueError("Invalid storage class: %r" % value)
             elif opt in ("--suffix", "-S",):
                 suffix = value
-            elif opt in ("--threads", "-t",):
-                threads = int(value)
+            elif opt in ("--write-threads",):
+                write_threads = int(value)
 
         if bucket_name is None:
             raise GetoptError("--bucket-name is required")
@@ -486,7 +617,8 @@ def main(args=None):
             if size is not None:
                 raise GetoptError("--size is valid only with --create")
             if storage_class is not None:
-                raise GetoptError("--storage-class is valid only with --create")
+                raise GetoptError("--storage-class is valid only with "
+                                  "--create")
             if suffix is not None:
                 raise GetoptError("--suffix is valid only with --create")
         else:
@@ -518,7 +650,11 @@ def main(args=None):
     logging.getLogger("boto").setLevel(logging.INFO)
 
     volume = UBDS3Volume(bucket_name, devname, region=region,
-                         n_threads=threads, profile_name=profile)
+                         handler_threads=handler_threads,
+                         write_threads=write_threads,
+                         s3_kw={'profile_name': profile,
+                                'proxy_user': proxy_user,
+                                'proxy_pass': proxy_password,})
     if create:
         volume.create_volume(block_size=block_size, encryption=encryption,
                              policy=policy, size=size,
@@ -566,6 +702,9 @@ Creating a new block device:
         The k, M, and G suffixes are base-2 (k == 2**10, M == 2**20,
         G == 2 ** 30).
 
+    --handler-threads <int>
+        Create the specified number of threads to handle block requests.
+
     --policy <policy> | -p <policy>
         Use the specified ACL policy.  This defaults to 'private'.  Valid
         values are 'private', 'public-read', 'public-read-write' (DANGEROUS),
@@ -585,6 +724,9 @@ Creating a new block device:
         Append the given suffix to object names.  This defaults to .<devname>.
         Object names are suffixed rather than prefixed to improve performance
         (due to the way S3 partitions the bucket keyspace).
+
+    --write-threads <int>
+        Create the specified number of threads to handle write-back requests.
 """)
 
     fd.flush()
