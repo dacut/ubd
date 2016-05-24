@@ -18,7 +18,7 @@ setup(
             "ubd-debug=ublkdev.ublkdev:debug",
         ]
     },
-    install_requires=["boto>=2.0", "six>=1.0", "futures>=3.0", "pylru>=1.0"],
+    install_requires=["boto>=2.0", "six>=1.0", "futures>=3.0"],
     #setup_requires=["nose>=1.0"],
 
     # PyPI information
