@@ -1,6 +1,12 @@
+# Dependencies:
+# AWS C++ SDK (must be manually compiled today).
+# Amazon Linux:
+#    json-c-0.11-6.8 (json-c-devel-0.11-6.8)
+
+
 TARGETS = libublkdev.so ublkdev-s3
 CPPFLAGS = -I. -I../../src
-CXXFLAGS = -std=c++11 -fPIC
+CXXFLAGS = -std=c++11 -fPIC -Wall
 
 LIB_SRCS = ublkdev.cc
 LIB_OBJS = $(LIB_SRCS:%.cc=%.o)
@@ -11,7 +17,7 @@ S3_SRCS = s3.cc
 S3_OBJS = $(S3_SRCS:%.cc=%.o)
 S3_LD = g++
 S3_LDFLAGS = -L.
-S3_LIBS = -lublkdev
+S3_LIBS = -lublkdev -laws-cpp-sdk-s3 -laws-cpp-sdk-core
 
 all: $(TARGETS)
 libublkdev.so: $(LIB_OBJS)
@@ -22,3 +28,8 @@ ublkdev-s3: $(S3_OBJS)
 
 %.o: %.c
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $<
+
+clean:
+	rm -f $(TARGETS) *.o *~
+
+.PHONY: all clean

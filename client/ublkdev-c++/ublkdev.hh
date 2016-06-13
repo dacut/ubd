@@ -38,7 +38,7 @@ public:
         std::runtime_error(what_arg), m_error(error) { }
 #endif /* C++11 */
             
-    inline int getError() { return m_error; }
+    inline int getError() const { return m_error; }
     
 private:
     const int m_error;
@@ -48,6 +48,7 @@ class UserBlockDevice {
 public:
     explicit UserBlockDevice(
         char const *control_endpoint="/dev/ubdctl");
+    UserBlockDevice(UserBlockDevice &&other);
     
     virtual ~UserBlockDevice();
 
@@ -68,19 +69,21 @@ public:
         uint32_t major);
 
     virtual void getRequest(
-        struct ubd_message *result /* IN/OUT */);
+        struct ubd_message &result /* IN/OUT */);
 
     virtual void putReply(
-        struct ubd_message const *reply /* IN */);
+        struct ubd_message const &reply /* IN */);
 
     virtual void debug();
 
+    int getDescriptor() { return m_control; }
+
+
 private:
-    UserBlockDevice(UserBlockDevice const &);
-    UserBlockDevice operator = (UserBlockDevice const &);
+    UserBlockDevice(UserBlockDevice const &) = delete;
+    UserBlockDevice operator = (UserBlockDevice const &) = delete;
 
     int m_control;
-    struct pollfd m_poll;
 };
 
 #endif /* UBLKDEV_HH */

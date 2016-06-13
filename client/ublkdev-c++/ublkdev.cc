@@ -10,10 +10,9 @@
 using std::string;
 
 UserBlockDevice::UserBlockDevice(
-    char const *control_endpoint)
+    char const *control_endpoint) :
+    m_control(open(control_endpoint, O_RDWR | O_SYNC | O_NONBLOCK))
 {
-    m_control = open(control_endpoint, O_RDWR | O_SYNC | O_NONBLOCK);
-
     if (m_control < 0) {
         string msg("Unable to open ");
 
@@ -24,14 +23,23 @@ UserBlockDevice::UserBlockDevice(
         throw UBDError(msg, errno);
     }
 
-    m_poll.fd = m_control;
-    m_poll.events = POLLIN;
+    return;
+}
+
+UserBlockDevice::UserBlockDevice(
+    UserBlockDevice &&other) :
+    m_control(other.m_control)
+{
+    other.m_control = -1;
     return;
 }
 
 UserBlockDevice::~UserBlockDevice()
 {
-    close(m_control);
+    if (m_control != -1) {
+        close(m_control);
+    }
+
     return;
 }
 
@@ -96,9 +104,9 @@ void UserBlockDevice::tie(
 }
 
 void UserBlockDevice::getRequest(
-    struct ubd_message *result)
+    struct ubd_message &result)
 {
-    if (ioctl(m_control, UBD_IOCGETREQUEST, result) != 0) {
+    if (ioctl(m_control, UBD_IOCGETREQUEST, &result) != 0) {
         throw UBDError(errno);
     }
 
@@ -106,9 +114,9 @@ void UserBlockDevice::getRequest(
 }
 
 void UserBlockDevice::putReply(
-    struct ubd_message const *reply)
+    struct ubd_message const &reply)
 {
-    if (ioctl(m_control, UBD_IOCPUTREPLY, reply) != 0) {
+    if (ioctl(m_control, UBD_IOCPUTREPLY, &reply) != 0) {
         throw UBDError(errno);
     }
 
@@ -123,3 +131,4 @@ void UserBlockDevice::debug()
 
     return;
 }
+
