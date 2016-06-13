@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <ublkdev.hh>
 #include <aws/core/Aws.h>
+#include <aws/core/utils/json/JsonSerializer.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
@@ -27,6 +28,7 @@ using Aws::S3::Model::ServerSideEncryption;
 using Aws::S3::Model::ServerSideEncryptionMapper::GetNameForServerSideEncryption;
 using Aws::S3::Model::StorageClass;
 using Aws::S3::Model::StorageClassMapper::GetNameForStorageClass;
+using Aws::Utils::Json::JsonValue;
 
 UBDS3Volume::UBDS3Volume(
     Aws::String const &bucket_name,
@@ -93,7 +95,6 @@ void UBDS3Volume::createVolume(
     StorageClass storage_class,
     Aws::String const &suffix)
 {
-    std::shared_ptr<std::stringstream> config(new std::stringstream);
     milliseconds sleep_time(100);
 
     m_block_size = blockSize;
@@ -101,39 +102,24 @@ void UBDS3Volume::createVolume(
     m_policy = policy;
     m_storage_class = storage_class;
 
-    *config << "{\"block-size\": " << blockSize
-            << ", \"policy\": \"" << GetNameForObjectCannedACL(policy).c_str()
-            << "\", \"size\": " << size
-            << ", \"storage-class\": \""
-            << GetNameForStorageClass(storage_class).c_str() << "\"";
+    JsonValue config = JsonValue()
+        .WithInteger("block-size", blockSize)
+        .WithString("policy", GetNameForObjectCannedACL(policy))
+        .WithInt64("size", size)
+        .WithString("storage-class", GetNameForStorageClass(storage_class));
 
     if (encryption != ServerSideEncryption::NOT_SET) {
-        *config << ", \"encryption\": \""
-                << GetNameForServerSideEncryption(encryption) << "\"";
+        config = config.WithString(
+            "encryption", GetNameForServerSideEncryption(encryption));
     }
 
     if (suffix.length() > 0) {
-        *config << ", \"suffix\": \"";
-
-        for (auto c : suffix) {
-            if (c == '"') {
-                *config << "\\\"";
-            }
-            else if (c == '\\') {
-                *config << "\\\\";
-            }
-            else if (c < ' ' || c >= '\x7f') {
-                *config << "\\x" << std::setw(2) << std::setfill('0')
-                        << std::hex << static_cast<unsigned int>(c);
-            }
-        }
-
-        *config << "\"";
+        config = config.WithString("suffix", suffix);
     }
 
-    *config << "}";
-
-    config->seekg(0);
+    std::shared_ptr<std::stringstream> body(new std::stringstream);
+    config.WriteReadable(*body);
+    body->seekg(0);
 
     S3Client s3(getS3Configuration());
     PutObjectRequest req;
@@ -141,7 +127,7 @@ void UBDS3Volume::createVolume(
     req.SetKey(m_devname + ".volinfo");
     req.SetACL(m_policy);
     req.SetStorageClass(m_storage_class);
-    req.SetBody(config);
+    req.SetBody(body);
 
     while (true) {
         auto outcome = s3.PutObject(req);

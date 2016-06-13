@@ -1,7 +1,5 @@
 # Dependencies:
 # AWS C++ SDK (must be manually compiled today).
-# Amazon Linux:
-#    json-c-0.11-6.8 (json-c-devel-0.11-6.8)
 
 
 TARGETS = libublkdev.so ublkdev-s3
