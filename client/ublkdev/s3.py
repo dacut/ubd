@@ -553,7 +553,7 @@ def main(args=None):
                 region = value
             elif opt in ("--size", "-s",):
                 size = parse_size(value, "size", min=0, max=(1<<64))
-            elif opt in ("--storage-class", "-s",):
+            elif opt in ("--storage-class", "-C",):
                 storage_class = value
                 if storage_class not in ("standard", "reduced-redundancy",
                                          "infrequently-accessed"):
