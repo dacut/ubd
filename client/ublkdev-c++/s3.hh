@@ -21,7 +21,8 @@ public:
     UBDS3Volume(
         Aws::String const &bucket_name,
         Aws::String const &devname,
-        Aws::String const &region,
+        std::shared_ptr<Aws::Auth::AWSCredentialsProvider> &auth,
+        Aws::Client::ClientConfiguration const &client_config,
         uint32_t thread_count);
 
     virtual ~UBDS3Volume();
@@ -60,6 +61,9 @@ public:
         uint64_t offset,
         uint32_t length);
 
+    virtual std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
+    getS3Credentials();
+
     virtual Aws::Client::ClientConfiguration getS3Configuration();
 
     uint32_t getMajor() { return m_major; }
@@ -87,7 +91,8 @@ private:
     UserBlockDevice *m_ubd;
     Aws::String m_bucket_name;
     Aws::String m_devname;
-    Aws::String m_region;
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> m_auth;
+    Aws::Client::ClientConfiguration m_client_config;
     uint32_t m_thread_count;
     uint32_t m_block_size;
     Aws::S3::Model::ServerSideEncryption m_encryption;

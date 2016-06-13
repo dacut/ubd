@@ -4,14 +4,14 @@
 
 TARGETS = libublkdev.so ublkdev-s3
 CPPFLAGS = -I. -I../../src
-CXXFLAGS = -std=c++11 -fPIC -Wall
+CXXFLAGS = -std=c++11 -fPIC -Wall -g
 
 LIB_SRCS = ublkdev.cc
 LIB_OBJS = $(LIB_SRCS:%.cc=%.o)
 LIB_LD = g++
 LIB_LDFLAGS = -shared
 
-S3_SRCS = s3.cc
+S3_SRCS = regionmap.cc s3.cc
 S3_OBJS = $(S3_SRCS:%.cc=%.o)
 S3_LD = g++
 S3_LDFLAGS = -L.
