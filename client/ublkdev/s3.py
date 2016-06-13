@@ -193,8 +193,6 @@ class UBDS3Volume(object):
             for thread in self.threads:
                 thread.join()
 
-            self.write_executor.shutdown()
-
         return
         
     def read_volume_info(self):
