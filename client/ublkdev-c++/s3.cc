@@ -114,7 +114,7 @@ static struct option longopts[] = {
 };
 
 int main(int argc, char *argv[]) {
-    // XXX
+    Aws::SDKOptions sdk_options;
     String bucket_name;
     uint64_t block_size = 0;
     bool create = false;
@@ -347,57 +347,65 @@ int main(int argc, char *argv[]) {
         suffix = "." + devname;
     }
 
-    ClientConfiguration client_config;
-    if (region) {
-        client_config.region = *region;
-    }
+    Aws::InitAPI(sdk_options);
+    try {
+        ClientConfiguration client_config;
+        if (region) {
+            client_config.region = *region;
+        }
     
-    if (proxy_host) {
-        client_config.proxyHost = *proxy_host;
-    }
+        if (proxy_host) {
+            client_config.proxyHost = *proxy_host;
+        }
 
-    if (proxy_user) {
-        client_config.proxyUserName = *proxy_user;
-    }
+        if (proxy_user) {
+            client_config.proxyUserName = *proxy_user;
+        }
 
-    if (proxy_password) {
-        client_config.proxyPassword = *proxy_password;
-    }
+        if (proxy_password) {
+            client_config.proxyPassword = *proxy_password;
+        }
 
-    if (proxy_port != 0) {
-        client_config.proxyPort = proxy_port;
-    }
+        if (proxy_port != 0) {
+            client_config.proxyPort = proxy_port;
+        }
 
-    shared_ptr<AWSCredentialsProvider> creds;
+        shared_ptr<AWSCredentialsProvider> creds;
 
-    if (profile) {
-        creds = shared_ptr<AWSCredentialsProvider>(
-            new ProfileConfigFileAWSCredentialsProvider(profile->c_str()));
-    }
-    else if (getenv("AWS_ACCESS_KEY_ID") != nullptr &&
-             getenv("AWS_SECRET_ACCESS_KEY") != nullptr)
-    {
-        creds = shared_ptr<AWSCredentialsProvider>(
-            new EnvironmentAWSCredentialsProvider);
-    }
-    else {
-        creds = shared_ptr<AWSCredentialsProvider>(
-            new InstanceProfileCredentialsProvider);
-    }
+        if (profile) {
+            creds = shared_ptr<AWSCredentialsProvider>(
+                new ProfileConfigFileAWSCredentialsProvider(profile->c_str()));
+        }
+        else if (getenv("AWS_ACCESS_KEY_ID") != nullptr &&
+                 getenv("AWS_SECRET_ACCESS_KEY") != nullptr)
+        {
+            creds = shared_ptr<AWSCredentialsProvider>(
+                new EnvironmentAWSCredentialsProvider);
+        }
+        else {
+            creds = shared_ptr<AWSCredentialsProvider>(
+                new InstanceProfileCredentialsProvider);
+        }
 
-    UBDS3Volume vol(bucket_name, devname, creds, client_config,
-                    thread_count);
-    if (create) {
-        vol.createVolume(size, block_size, sse, policy, storage_class,
-                          suffix);
-    } else {
-        vol.readVolumeInfo();
+        UBDS3Volume vol(bucket_name, devname, creds, client_config,
+                        thread_count);
+        if (create) {
+            vol.createVolume(size, block_size, sse, policy, storage_class,
+                             suffix);
+        } else {
+            vol.readVolumeInfo();
+        }
+
+        vol.registerVolume();
+        vol.run();
+
+        Aws::ShutdownAPI(sdk_options);
+        return 0;
     }
-
-    vol.registerVolume();
-    vol.run();
-
-    return 0;
+    catch (...) {
+        Aws::ShutdownAPI(sdk_options);
+        throw;
+    }
 }
 
 UBDS3Volume::UBDS3Volume(
