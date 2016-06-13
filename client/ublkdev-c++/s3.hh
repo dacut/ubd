@@ -27,7 +27,8 @@ public:
     virtual void readVolumeInfo();
 
     virtual void createVolume(
-        uint32_t blockSize,
+        uint64_t size,
+        uint32_t blockSize = 4096,
         Aws::S3::Model::ServerSideEncryption encryption =
         Aws::S3::Model::ServerSideEncryption::NOT_SET,
         Aws::S3::Model::ObjectCannedACL policy =

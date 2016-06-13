@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 
@@ -13,6 +14,20 @@
 
 #define INITIAL_BUFFER_SIZE (4096)
 
+using std::chrono::milliseconds;
+using std::chrono::seconds;
+
+using Aws::S3::S3Client;
+using Aws::S3::Model::DeleteObjectRequest;
+using Aws::S3::Model::GetObjectRequest;
+using Aws::S3::Model::ObjectCannedACL;
+using Aws::S3::Model::ObjectCannedACLMapper::GetNameForObjectCannedACL;
+using Aws::S3::Model::PutObjectRequest;
+using Aws::S3::Model::ServerSideEncryption;
+using Aws::S3::Model::ServerSideEncryptionMapper::GetNameForServerSideEncryption;
+using Aws::S3::Model::StorageClass;
+using Aws::S3::Model::StorageClassMapper::GetNameForStorageClass;
+
 UBDS3Volume::UBDS3Volume(
     Aws::String const &bucket_name,
     Aws::String const &devname,
@@ -24,9 +39,9 @@ UBDS3Volume::UBDS3Volume(
     m_region(region),
     m_thread_count(thread_count),
     m_block_size(-1),
-    m_encryption(Aws::S3::Model::ServerSideEncryption::NOT_SET),
-    m_policy(Aws::S3::Model::ObjectCannedACL::private_),
-    m_storage_class(Aws::S3::Model::StorageClass::STANDARD),
+    m_encryption(ServerSideEncryption::NOT_SET),
+    m_policy(ObjectCannedACL::private_),
+    m_storage_class(StorageClass::STANDARD),
     m_suffix(),
     m_size(0ull),
     m_major(0),
@@ -71,17 +86,87 @@ void UBDS3Volume::readVolumeInfo() {
 }
 
 void UBDS3Volume::createVolume(
+    uint64_t size,
     uint32_t blockSize,
-    Aws::S3::Model::ServerSideEncryption encryption,
-    Aws::S3::Model::ObjectCannedACL policy,
-    Aws::S3::Model::StorageClass storage_class,
+    ServerSideEncryption encryption,
+    ObjectCannedACL policy,
+    StorageClass storage_class,
     Aws::String const &suffix)
 {
-    // XXX
+    std::shared_ptr<std::stringstream> config(new std::stringstream);
+    milliseconds sleep_time(100);
+
+    m_block_size = blockSize;
+    m_encryption = encryption;
+    m_policy = policy;
+    m_storage_class = storage_class;
+
+    *config << "{\"block-size\": " << blockSize
+            << ", \"policy\": \"" << GetNameForObjectCannedACL(policy).c_str()
+            << "\", \"size\": " << size
+            << ", \"storage-class\": \""
+            << GetNameForStorageClass(storage_class).c_str() << "\"";
+
+    if (encryption != ServerSideEncryption::NOT_SET) {
+        *config << ", \"encryption\": \""
+                << GetNameForServerSideEncryption(encryption) << "\"";
+    }
+
+    if (suffix.length() > 0) {
+        *config << ", \"suffix\": \"";
+
+        for (auto c : suffix) {
+            if (c == '"') {
+                *config << "\\\"";
+            }
+            else if (c == '\\') {
+                *config << "\\\\";
+            }
+            else if (c < ' ' || c >= '\x7f') {
+                *config << "\\x" << std::setw(2) << std::setfill('0')
+                        << std::hex << static_cast<unsigned int>(c);
+            }
+        }
+
+        *config << "\"";
+    }
+
+    *config << "}";
+
+    config->seekg(0);
+
+    S3Client s3(getS3Configuration());
+    PutObjectRequest req;
+    req.SetBucket(m_bucket_name);
+    req.SetKey(m_devname + ".volinfo");
+    req.SetACL(m_policy);
+    req.SetStorageClass(m_storage_class);
+    req.SetBody(config);
+
+    while (true) {
+        auto outcome = s3.PutObject(req);
+        if (outcome.IsSuccess()) {
+            return;
+        }
+
+        auto &error = outcome.GetError();
+
+        if (error.ShouldRetry()) {
+            std::this_thread::sleep_for(sleep_time);
+            sleep_time = sleep_time * 3 / 2;
+            if (sleep_time > seconds(5)) {
+                sleep_time = seconds(5);
+            }
+
+            continue;
+        }
+
+        throw UBDError(EIO);
+    }
 }
 
 void UBDS3Volume::read(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t offset,
     void *buffer /* OUT */,
     uint32_t length)
@@ -117,7 +202,7 @@ void UBDS3Volume::read(
 }
 
 void UBDS3Volume::write(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t offset,
     void const *buffer,
     uint32_t length)
@@ -168,7 +253,7 @@ void UBDS3Volume::write(
 }
 
 void UBDS3Volume::trim(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t offset,
     uint32_t length)
 {
@@ -248,20 +333,21 @@ Aws::String UBDS3Volume::blockToPrefix(
 }
 
 void UBDS3Volume::readBlock(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t block_id,
     void *buffer)
 {
-    Aws::S3::Model::GetObjectRequest req;
-    std::chrono::milliseconds sleep_time(100);
+    GetObjectRequest req;
+    milliseconds sleep_time(100);
     req.SetBucket(m_bucket_name);
     req.SetKey(blockToPrefix(block_id) + m_suffix);
 
     while (true) {
-        Aws::S3::Model::GetObjectOutcome outcome = s3.GetObject(req);
+        auto outcome = s3.GetObject(req);
+
         if (outcome.IsSuccess()) {
-            Aws::S3::Model::GetObjectResult &result = outcome.GetResult();
-            Aws::IOStream &body = result.GetBody();
+            auto &result = outcome.GetResult();
+            auto &body = result.GetBody();
             
             body.read(static_cast<char *>(buffer), m_block_size);
             if (body.gcount() != m_block_size) {
@@ -285,8 +371,8 @@ void UBDS3Volume::readBlock(
         if (error.ShouldRetry()) {
             std::this_thread::sleep_for(sleep_time);
             sleep_time = sleep_time * 3 / 2;
-            if (sleep_time > std::chrono::seconds(5)) {
-                sleep_time = std::chrono::seconds(5);
+            if (sleep_time > seconds(5)) {
+                sleep_time = seconds(5);
             }
 
             continue;
@@ -297,12 +383,12 @@ void UBDS3Volume::readBlock(
 }
 
 void UBDS3Volume::writeBlock(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t block_id,
     const void *buffer)
 {
-    Aws::S3::Model::PutObjectRequest req;
-    std::chrono::milliseconds sleep_time(100);
+    PutObjectRequest req;
+    milliseconds sleep_time(100);
 
     std::shared_ptr<std::stringstream> body(new std::stringstream);
 
@@ -316,7 +402,7 @@ void UBDS3Volume::writeBlock(
     req.SetBody(body);
 
     while (true) {
-        Aws::S3::Model::PutObjectOutcome outcome = s3.PutObject(req);
+        auto outcome = s3.PutObject(req);
         if (outcome.IsSuccess()) {
             return;
         }
@@ -325,8 +411,8 @@ void UBDS3Volume::writeBlock(
         if (error.ShouldRetry()) {
             std::this_thread::sleep_for(sleep_time);
             sleep_time = sleep_time * 3 / 2;
-            if (sleep_time > std::chrono::seconds(5)) {
-                sleep_time = std::chrono::seconds(5);
+            if (sleep_time > seconds(5)) {
+                sleep_time = seconds(5);
             }
 
             continue;
@@ -337,17 +423,17 @@ void UBDS3Volume::writeBlock(
 }
 
 void UBDS3Volume::trimBlock(
-    Aws::S3::S3Client &s3,
+    S3Client &s3,
     uint64_t block_id)
 {
-    Aws::S3::Model::DeleteObjectRequest req;
-    std::chrono::milliseconds sleep_time(100);
+    DeleteObjectRequest req;
+    milliseconds sleep_time(100);
 
     req.SetBucket(m_bucket_name);
     req.SetKey(blockToPrefix(block_id) + m_suffix);
 
     while (true) {
-        Aws::S3::Model::DeleteObjectOutcome outcome = s3.DeleteObject(req);
+        auto outcome = s3.DeleteObject(req);
         if (outcome.IsSuccess()) {
             return;
         }
@@ -365,8 +451,8 @@ void UBDS3Volume::trimBlock(
         if (error.ShouldRetry()) {
             std::this_thread::sleep_for(sleep_time);
             sleep_time = sleep_time * 3 / 2;
-            if (sleep_time > std::chrono::seconds(5)) {
-                sleep_time = std::chrono::seconds(5);
+            if (sleep_time > seconds(5)) {
+                sleep_time = seconds(5);
             }
 
             continue;
