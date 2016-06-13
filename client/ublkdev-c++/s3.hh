@@ -10,6 +10,12 @@
 #include <aws/s3/model/ServerSideEncryption.h>
 #include <aws/s3/model/StorageClass.h>
 
+class UBDS3Error : public std::runtime_error {
+public:
+    UBDS3Error(std::string &what) : std::runtime_error(what) { }
+    UBDS3Error(char const *what) : std::runtime_error(what) { }
+};
+
 class UBDS3Volume {
 public:
     UBDS3Volume(

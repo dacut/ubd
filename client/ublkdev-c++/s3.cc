@@ -19,16 +19,115 @@ using std::chrono::milliseconds;
 using std::chrono::seconds;
 
 using Aws::S3::S3Client;
+using Aws::S3::S3Errors;
 using Aws::S3::Model::DeleteObjectRequest;
 using Aws::S3::Model::GetObjectRequest;
 using Aws::S3::Model::ObjectCannedACL;
 using Aws::S3::Model::ObjectCannedACLMapper::GetNameForObjectCannedACL;
+using Aws::S3::Model::ObjectCannedACLMapper::GetObjectCannedACLForName;
 using Aws::S3::Model::PutObjectRequest;
 using Aws::S3::Model::ServerSideEncryption;
 using Aws::S3::Model::ServerSideEncryptionMapper::GetNameForServerSideEncryption;
+using Aws::S3::Model::ServerSideEncryptionMapper::GetServerSideEncryptionForName;
 using Aws::S3::Model::StorageClass;
 using Aws::S3::Model::StorageClassMapper::GetNameForStorageClass;
+using Aws::S3::Model::StorageClassMapper::GetStorageClassForName;
 using Aws::Utils::Json::JsonValue;
+
+static Aws::String GetNameForS3Error(S3Errors err) {
+    switch (err) {
+
+    case S3Errors::INCOMPLETE_SIGNATURE:
+        return Aws::String("INCOMPLETE_SIGNATURE");
+
+    case S3Errors::INTERNAL_FAILURE:
+        return Aws::String("INTERNAL_FAILURE");
+
+    case S3Errors::INVALID_ACTION:
+        return Aws::String("INVALID_ACTION");
+
+    case S3Errors::INVALID_CLIENT_TOKEN_ID:
+        return Aws::String("INVALID_CLIENT_TOKEN_ID");
+
+    case S3Errors::INVALID_PARAMETER_COMBINATION:
+        return Aws::String("INVALID_PARAMETER_COMBINATION");
+
+    case S3Errors::INVALID_QUERY_PARAMETER:
+        return Aws::String("INVALID_QUERY_PARAMETER");
+
+    case S3Errors::INVALID_PARAMETER_VALUE:
+        return Aws::String("INVALID_PARAMETER_VALUE");
+
+    case S3Errors::MISSING_ACTION:
+        return Aws::String("MISSING_ACTION");
+
+    case S3Errors::MISSING_AUTHENTICATION_TOKEN:
+        return Aws::String("MISSING_AUTHENTICATION_TOKEN");
+
+    case S3Errors::MISSING_PARAMETER:
+        return Aws::String("MISSING_PARAMETER");
+
+    case S3Errors::OPT_IN_REQUIRED:
+        return Aws::String("OPT_IN_REQUIRED");
+
+    case S3Errors::REQUEST_EXPIRED:
+        return Aws::String("REQUEST_EXPIRED");
+
+    case S3Errors::SERVICE_UNAVAILABLE:
+        return Aws::String("SERVICE_UNAVAILABLE");
+
+    case S3Errors::THROTTLING:
+        return Aws::String("THROTTLING");
+
+    case S3Errors::VALIDATION:
+        return Aws::String("VALIDATION");
+
+    case S3Errors::ACCESS_DENIED:
+        return Aws::String("ACCESS_DENIED");
+
+    case S3Errors::RESOURCE_NOT_FOUND:
+        return Aws::String("RESOURCE_NOT_FOUND");
+
+    case S3Errors::UNRECOGNIZED_CLIENT:
+        return Aws::String("UNRECOGNIZED_CLIENT");
+
+    case S3Errors::MALFORMED_QUERY_STRING:
+        return Aws::String("MALFORMED_QUERY_STRING");
+
+    case S3Errors::NETWORK_CONNECTION:
+        return Aws::String("NETWORK_CONNECTION");
+
+    case S3Errors::UNKNOWN:
+        return Aws::String("UNKNOWN");
+
+    case S3Errors::BUCKET_ALREADY_EXISTS:
+        return Aws::String("BUCKET_ALREADY_EXISTS");
+
+    case S3Errors::BUCKET_ALREADY_OWNED_BY_YOU:
+        return Aws::String("BUCKET_ALREADY_OWNED_BY_YOU");
+
+    case S3Errors::NO_SUCH_BUCKET:
+        return Aws::String("NO_SUCH_BUCKET");
+
+    case S3Errors::NO_SUCH_KEY:
+        return Aws::String("NO_SUCH_KEY");
+
+    case S3Errors::NO_SUCH_UPLOAD:
+        return Aws::String("NO_SUCH_UPLOAD");
+
+    case S3Errors::OBJECT_ALREADY_IN_ACTIVE_TIER:
+        return Aws::String("OBJECT_ALREADY_IN_ACTIVE_TIER");
+
+    case S3Errors::OBJECT_NOT_IN_ACTIVE_TIER:
+        return Aws::String("OBJECT_NOT_IN_ACTIVE_TIER");
+    }
+
+    std::ostringstream msg;
+    msg << "Unknown error "
+        << static_cast<std::underlying_type<S3Errors>::type>(err);
+
+    return Aws::String(msg.str().c_str());
+}
 
 UBDS3Volume::UBDS3Volume(
     Aws::String const &bucket_name,
@@ -84,7 +183,72 @@ void UBDS3Volume::run() {
 }
 
 void UBDS3Volume::readVolumeInfo() {
-    // XXX
+    milliseconds sleep_time(100);
+
+    S3Client s3(getS3Configuration());
+    GetObjectRequest req;
+    req.SetBucket(m_bucket_name);
+    req.SetKey(m_devname + ".volinfo");
+    
+    while (true) {
+        auto outcome = s3.GetObject(req);
+        
+        if (outcome.IsSuccess()) {
+            auto &result = outcome.GetResult();
+            auto &body = result.GetBody();
+
+            JsonValue config(body);
+            if (! config.WasParseSuccessful()) {
+                std::clog << "Invalid JSON in s3://" << m_bucket_name << "/"
+                          << m_devname << ".volinfo: "
+                          << config.GetErrorMessage() << std::endl;
+                throw UBDError(EINVAL);
+            }
+
+            m_size = config.GetInt64("size");
+            m_block_size = config.GetInteger("block-size");
+            m_policy = GetObjectCannedACLForName(config.GetString("policy"));
+            m_storage_class = GetStorageClassForName(
+                config.GetString("storage-class"));
+
+            if (config.ValueExists("encryption")) {
+                m_encryption = GetServerSideEncryptionForName(
+                    config.GetString("encryption"));
+            } else {
+                m_encryption = ServerSideEncryption::NOT_SET;
+            }
+
+            if (config.ValueExists("suffix")) {
+                m_suffix = config.GetString("suffix");
+            } else {
+                m_suffix = "";
+            }
+
+            return;
+        }
+
+        auto &error = outcome.GetError();
+        auto ecode = error.GetErrorType();
+
+        if (error.ShouldRetry()) {
+            std::this_thread::sleep_for(sleep_time);
+            sleep_time = sleep_time * 3 / 2;
+            if (sleep_time > seconds(5)) {
+                sleep_time = seconds(5);
+            }
+
+            continue;
+        }
+
+        std::string message("Failed to read s3://");
+        message += m_bucket_name.c_str();
+        message += '/';
+        message += m_devname.c_str();
+        message += ".volinfo: ";
+        message += GetNameForS3Error(ecode).c_str();
+
+        throw UBDS3Error(message);
+    }
 }
 
 void UBDS3Volume::createVolume(
@@ -103,9 +267,9 @@ void UBDS3Volume::createVolume(
     m_storage_class = storage_class;
 
     JsonValue config = JsonValue()
+        .WithInt64("size", size)
         .WithInteger("block-size", blockSize)
         .WithString("policy", GetNameForObjectCannedACL(policy))
-        .WithInt64("size", size)
         .WithString("storage-class", GetNameForStorageClass(storage_class));
 
     if (encryption != ServerSideEncryption::NOT_SET) {
@@ -147,7 +311,15 @@ void UBDS3Volume::createVolume(
             continue;
         }
 
-        throw UBDError(EIO);
+        auto ecode = error.GetErrorType();
+        std::string message("Failed to write s3://");
+        message += m_bucket_name.c_str();
+        message += '/';
+        message += m_devname.c_str();
+        message += ".volinfo: ";
+        message += GetNameForS3Error(ecode).c_str();
+
+        throw UBDS3Error(message);
     }
 }
 
@@ -325,8 +497,9 @@ void UBDS3Volume::readBlock(
 {
     GetObjectRequest req;
     milliseconds sleep_time(100);
+    Aws::String key = blockToPrefix(block_id) + m_suffix;
     req.SetBucket(m_bucket_name);
-    req.SetKey(blockToPrefix(block_id) + m_suffix);
+    req.SetKey(key);
 
     while (true) {
         auto outcome = s3.GetObject(req);
@@ -337,7 +510,17 @@ void UBDS3Volume::readBlock(
             
             body.read(static_cast<char *>(buffer), m_block_size);
             if (body.gcount() != m_block_size) {
-                throw UBDError(EIO);
+                std::string message("While reading s3://");
+                message += m_bucket_name.c_str();
+                message += '/';
+                message += key.c_str();
+                message += ": short read (expected ";
+                message += m_block_size;
+                message += " bytes, read ";
+                message += body.gcount();
+                message += ")";
+
+                throw UBDError(message, EIO);
             }
 
             return;
@@ -364,7 +547,9 @@ void UBDS3Volume::readBlock(
             continue;
         }
 
-        throw UBDError(EIO);
+        throw UBDError(
+            ("While reading s3://" + m_bucket_name + "/" + key + ": " +
+             GetNameForS3Error(ecode)).c_str(), EIO);
     }
 }
 
@@ -375,6 +560,7 @@ void UBDS3Volume::writeBlock(
 {
     PutObjectRequest req;
     milliseconds sleep_time(100);
+    Aws::String key = blockToPrefix(block_id) + m_suffix;
 
     std::shared_ptr<std::stringstream> body(new std::stringstream);
 
@@ -382,7 +568,7 @@ void UBDS3Volume::writeBlock(
         const_cast<char *>(static_cast<char const *>(buffer)), m_block_size);
 
     req.SetBucket(m_bucket_name);
-    req.SetKey(blockToPrefix(block_id) + m_suffix);
+    req.SetKey(key);
     req.SetACL(m_policy);
     req.SetStorageClass(m_storage_class);
     req.SetBody(body);
@@ -404,7 +590,11 @@ void UBDS3Volume::writeBlock(
             continue;
         }
 
-        throw UBDError(EIO);
+        auto ecode = error.GetErrorType();
+
+        throw UBDError(
+            ("While writing s3://" + m_bucket_name + "/" + key + ": " +
+             GetNameForS3Error(ecode)).c_str(), EIO);
     }
 }
 
@@ -414,9 +604,10 @@ void UBDS3Volume::trimBlock(
 {
     DeleteObjectRequest req;
     milliseconds sleep_time(100);
+    Aws::String key = blockToPrefix(block_id) + m_suffix;
 
     req.SetBucket(m_bucket_name);
-    req.SetKey(blockToPrefix(block_id) + m_suffix);
+    req.SetKey(key);
 
     while (true) {
         auto outcome = s3.DeleteObject(req);
@@ -444,7 +635,9 @@ void UBDS3Volume::trimBlock(
             continue;
         }
 
-        throw UBDError(EIO);
+        throw UBDError(
+            ("While deleting s3://" + m_bucket_name + "/" + key + ": " +
+             GetNameForS3Error(ecode)).c_str(), EIO);
     }
 }
 
