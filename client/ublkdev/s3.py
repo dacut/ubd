@@ -208,7 +208,7 @@ class UBDS3Volume(object):
             self.encryption = config.get("encryption")
             self.policy = config.get("policy", "private")
             self.size = int(config.get("size"))
-            self.storage_class = config.get("storage_class", "standard")
+            self.storage_class = config.get("storage-class", "standard")
             self.suffix = config.get("suffix", "." + self.devname)
 
         return
