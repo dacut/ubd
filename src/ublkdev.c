@@ -960,12 +960,13 @@ static long ubdctl_ioctl_getrequest(
         if (write_size > msg.ubd_size) {
             ubd_warning("Insufficient buffer space: need %u bytes; userspace "
                         "provided only %u bytes.", write_size, msg.ubd_size);
+            msg.ubd_size = write_size;
             spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-            return write_size;
+            return -ENOMEM;
         }
 
         msg.ubd_msgtype = UBD_MSGTYPE_WRITE;
-        msg.ubd_size = msg.ubd_nsectors << 9;
+        msg.ubd_size = write_size;
 
         // Copy the data from the write request over to the userspace buffer.
         rq_for_each_segment(bvec, req, iter) {
