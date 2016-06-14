@@ -956,7 +956,11 @@ void UBDS3Handler::run() {
                 if (e.getError() == ENOMEM) {
                     // Resize the buffer
                     try {
+                        cerr << "ENOMEM -- allocated " << m_buffer_size
+                             << " bytes but need " << m_message.ubd_size
+                             << " bytes" << endl;
                         resizeBuffer(m_message.ubd_size);
+                        cerr << "Now have " << m_buffer_size << " bytes" << endl;
                     }
                     catch (bad_alloc &) {
                         cerr << "Thread " << std::this_thread::get_id()

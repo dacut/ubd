@@ -964,6 +964,7 @@ static long ubdctl_ioctl_getrequest(
             ubd_warning("Insufficient buffer space: need %u bytes; userspace "
                         "provided only %u bytes.", write_size, msg.ubd_size);
             msg.ubd_size = write_size;
+            copy_to_user((void *) data, &msg, sizeof(msg));
             spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
             return -ENOMEM;
         }
