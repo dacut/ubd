@@ -549,6 +549,7 @@ void UBDS3Volume::createVolume(
     m_encryption = encryption;
     m_policy = policy;
     m_storage_class = storage_class;
+    m_suffix = suffix;
 
     JsonValue config = JsonValue()
         .WithInt64("size", size)
@@ -993,8 +994,7 @@ void UBDS3Handler::handleUBDRequest() {
         }
 
         m_volume->read(m_s3, offset, m_message.ubd_data, length);
-        m_message.ubd_status = m_message.ubd_size;
-        m_message.ubd_size = length;
+        m_message.ubd_status = m_message.ubd_size = length;
         m_ubd.putReply(m_message);
         break;
 
