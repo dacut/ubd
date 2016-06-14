@@ -1,0 +1,5 @@
+#!/bin/sh
+PWD=$(realpath $(dirname $0))
+LD_LIBRARY_PATH=$PWD:/usr/local/lib \
+               exec $PWD/ublkdev-s3 "$@"
+
