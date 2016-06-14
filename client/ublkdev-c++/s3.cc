@@ -347,6 +347,7 @@ int main(int argc, char *argv[]) {
         suffix = "." + devname;
     }
 
+    sdk_options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
     Aws::InitAPI(sdk_options);
     try {
         ClientConfiguration client_config;
@@ -926,6 +927,8 @@ void UBDS3Handler::run() {
     struct pollfd fds[1];
     struct ubd_message message;
 
+    cerr << "Thread " << std::this_thread::get_id() << " started" << endl;
+
     fds[0].fd = m_ubd.getDescriptor();
     fds[0].events = POLLIN;
 
@@ -940,6 +943,8 @@ void UBDS3Handler::run() {
 
         if (poll_result > 0) {
             // Event ready.
+            cerr << "Thread " << std::this_thread::get_id() << " processing a message" << endl;
+
             try {
                 m_message.ubd_size = m_buffer_size;
                 m_ubd.getRequest(m_message);
@@ -970,6 +975,10 @@ void UBDS3Handler::handleUBDRequest() {
 
     switch (m_message.ubd_msgtype) {
     case UBD_MSGTYPE_READ:
+        cerr << "Thread " << std::this_thread::get_id()
+             << ": read (first_sector=" << m_message.ubd_first_sector
+             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
+
         if (length > m_buffer_size) {
             try {
                 resizeBuffer(length);
@@ -988,6 +997,10 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_WRITE:
+        cerr << "Thread " << std::this_thread::get_id()
+             << ": write (first_sector=" << m_message.ubd_first_sector
+             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
+
         m_volume->write(m_s3, offset, m_message.ubd_data, length);
         m_message.ubd_status = length;
         m_message.ubd_size = 0;
@@ -995,6 +1008,10 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_DISCARD:
+        cerr << "Thread " << std::this_thread::get_id()
+             << ": discard (first_sector=" << m_message.ubd_first_sector
+             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
+
         m_volume->trim(m_s3, offset, m_message.ubd_size);
         m_message.ubd_status = length;
         m_message.ubd_size = 0;
@@ -1002,12 +1019,18 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_FLUSH:
+        cerr << "Thread " << std::this_thread::get_id()
+             << ": flush (first_sector=" << m_message.ubd_first_sector
+             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
+
         m_message.ubd_status = length;
         m_message.ubd_size = 0;
         m_ubd.putReply(m_message);
         break;
 
     default:
+        cerr << "Thread " << std::this_thread::get_id()
+             << ": invalid message " << m_message.ubd_msgtype << endl;
         m_message.ubd_status = -EINVAL;
         m_ubd.putReply(m_message);
         break;
