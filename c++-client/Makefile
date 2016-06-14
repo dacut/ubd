@@ -3,7 +3,7 @@
 
 
 TARGETS = libublkdev.so ublkdev-s3
-CPPFLAGS = -I. -I../../src
+CPPFLAGS = -I. -I../kernel
 CXXFLAGS = -std=c++11 -fPIC -Wall -g
 
 LIB_SRCS = ublkdev.cc

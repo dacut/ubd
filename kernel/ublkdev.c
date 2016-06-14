@@ -930,6 +930,7 @@ static long ubdctl_ioctl_getrequest(
 
     // Wait for a message to become available *and* a tag slot to become
     // available.
+    ubd_debug("About to enter spinlock to wait for a message");
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
     if (wait_event_interruptible_locked(
             dev->wait,
@@ -940,23 +941,39 @@ static long ubdctl_ioctl_getrequest(
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -ERESTARTSYS;
     }
+    ubd_debug("Message and tag available");
 
     msg.ubd_nsectors = blk_rq_sectors(req);
     msg.ubd_first_sector = blk_rq_pos(req);
 
     // Fill in the remaining details.
     if ((req->cmd_flags & REQ_DISCARD) != 0) {
+        ubd_debug("Got a discard request (first_sector=%llu, nsectors=%llu)",
+                  (long long unsigned) msg.ubd_first_sector,
+                  (long long unsigned) msg.ubd_nsectors);
         msg.ubd_msgtype = UBD_MSGTYPE_DISCARD;
         msg.ubd_size = 0;
     } else if ((req->cmd_flags & REQ_FLUSH) != 0) {
+        ubd_debug("Got a flush request (first_sector=%llu, nsectors=%llu)",
+                  (long long unsigned) msg.ubd_first_sector,
+                  (long long unsigned) msg.ubd_nsectors);
         msg.ubd_msgtype = UBD_MSGTYPE_FLUSH;
         msg.ubd_size = 0;
     } else if (rq_data_dir(req) == READ) {
+        ubd_debug("Got a read request (first_sector=%llu, nsectors=%llu)",
+                  (long long unsigned) msg.ubd_first_sector,
+                  (long long unsigned) msg.ubd_nsectors);
+
         msg.ubd_msgtype = UBD_MSGTYPE_READ;
         msg.ubd_size = 0;
     } else {
         void __user *dest = msg.ubd_data;
         uint32_t write_size = msg.ubd_nsectors << 9;
+
+        ubd_debug("Got a write request (first_sector=%llu, nsectors=%llu)",
+                  (long long unsigned) msg.ubd_first_sector,
+                  (long long unsigned) msg.ubd_nsectors);
+
 
         BUG_ON(rq_data_dir(req) != WRITE);
         
@@ -1005,6 +1022,8 @@ static long ubdctl_ioctl_getrequest(
         }
     }
 
+    ubd_debug("Allocated tag %u", tag);
+
     BUG_ON(tag == max_pending_reply);
     msg.ubd_tag = tag;
     ACCESS_ONCE(dev->pending_reply[tag]) = req;
@@ -1027,6 +1046,7 @@ static long ubdctl_ioctl_getrequest(
     }
 
     spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    ubd_debug("Left spinlock");
 
     return 0;
 }

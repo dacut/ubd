@@ -948,29 +948,34 @@ void UBDS3Handler::run() {
             // Event ready.
             cerr << "Thread " << std::this_thread::get_id() << " processing a message" << endl;
 
-            try {
-                m_message.ubd_size = m_buffer_size;
-                m_ubd.getRequest(m_message);
-            }
-            catch (UBDError const &e) {
-                if (e.getError() == ENOMEM) {
-                    // Resize the buffer
-                    try {
-                        cerr << "ENOMEM -- allocated " << m_buffer_size
-                             << " bytes but need " << m_message.ubd_size
-                             << " bytes" << endl;
-                        resizeBuffer(m_message.ubd_size);
-                        cerr << "Now have " << m_buffer_size << " bytes" << endl;
-                    }
-                    catch (bad_alloc &) {
-                        cerr << "Thread " << std::this_thread::get_id()
-                             << " failed to allocate " << message.ubd_size
-                             << " bytes; exiting." << endl;
-                        break;
+            while (true) {
+                try {
+                    m_message.ubd_size = m_buffer_size;
+                    m_ubd.getRequest(m_message);
+                    break;
+                }
+                catch (UBDError const &e) {
+                    if (e.getError() == ENOMEM) {
+                        // Resize the buffer
+                        try {
+                            cerr << std::this_thread::get_id()
+                                 << ": ENOMEM -- allocated " << m_buffer_size
+                                 << " bytes but need " << m_message.ubd_size
+                                 << " bytes" << endl;
+                            resizeBuffer(m_message.ubd_size);
+                            cerr << std::this_thread::get_id()
+                                 << ": Now have " << m_buffer_size << " bytes" << endl;
+                        }
+                        catch (bad_alloc &) {
+                            cerr << "Thread " << std::this_thread::get_id()
+                                 << " failed to allocate " << message.ubd_size
+                                 << " bytes; exiting." << endl;
+                            break;
+                        }
                     }
                 }
             }
-
+            
             handleUBDRequest();
         }
     }
