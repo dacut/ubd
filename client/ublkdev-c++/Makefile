@@ -15,7 +15,7 @@ S3_SRCS = regionmap.cc s3.cc
 S3_OBJS = $(S3_SRCS:%.cc=%.o)
 S3_LD = g++
 S3_LDFLAGS = -L.
-S3_LIBS = -lublkdev -laws-cpp-sdk-s3 -laws-cpp-sdk-core
+S3_LIBS = -lublkdev -laws-cpp-sdk-s3 -laws-cpp-sdk-core -lpthread
 
 all: $(TARGETS)
 libublkdev.so: $(LIB_OBJS)

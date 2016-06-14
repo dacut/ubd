@@ -373,6 +373,7 @@ int main(int argc, char *argv[]) {
         shared_ptr<AWSCredentialsProvider> creds;
 
         if (profile) {
+            cerr << "Using ProfileConfigFileAWSCredentialsProvider" << endl;
             creds = shared_ptr<AWSCredentialsProvider>(
                 new ProfileConfigFileAWSCredentialsProvider(profile->c_str()));
         }
