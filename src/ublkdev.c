@@ -648,6 +648,9 @@ static long ubdctl_ioctl_register(
     dev->n_control_handles = 0;
     dev->n_block_handles = 0;
 
+    ubd_debug("Registering %s with %llu sectors", info.ubd_name,
+              (long long unsigned) info.ubd_nsectors);
+
     // Flush everything before the work function might start.
     smp_wmb();
 
@@ -1365,7 +1368,9 @@ static void ubdblk_add_disk(struct work_struct *work) {
 
     BUG_ON(dev == NULL);
 
-    /* Go from registering to running+adding */
+    ubd_debug("Adding disk %.*s", DISK_NAME_LEN, dev->disk->disk_name);
+
+    /* Go from registering to running */
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
     status = ACCESS_ONCE(dev->status);
     BUG_ON(status != UBD_STATUS_REGISTERING);
@@ -1376,6 +1381,8 @@ static void ubdblk_add_disk(struct work_struct *work) {
 
     /* Add the disk to the system. */
     add_disk(dev->disk);
+
+    ubd_debug("Added disk %.*s", DISK_NAME_LEN, dev->disk->disk_name);
 
     return;
 }
@@ -1393,6 +1400,8 @@ static void ubdblk_handle_request(struct request_queue *rq) {
     while ((req = blk_fetch_request(rq)) != NULL) {
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         status = dev->status;
+
+        ubd_debug("Handling a request");
 
         if (unlikely(status == UBD_STATUS_TERMINATED)) {
             // Device is not running; fail the request.
@@ -1429,6 +1438,13 @@ static void ubdblk_handle_fs_request(
     BUG_ON(req == NULL);
 
     tail = ACCESS_ONCE(dev->pending_delivery_tail);
+
+    ubd_debug("ubdblk_handle_fs_request: queueing %s request for sector %llu to %llu",
+              ((req->cmd_flags & REQ_DISCARD) ? "discard" :
+               (req->cmd_flags & REQ_FLUSH) ? "flush" :
+               (rq_data_dir(req) == READ) ? "read" : "write"),
+              (long long unsigned) blk_rq_pos(req),
+              (long long unsigned) blk_rq_sectors(req));
 
     ACCESS_ONCE(dev->pending_delivery_tail) = req;
     if (tail == NULL) {

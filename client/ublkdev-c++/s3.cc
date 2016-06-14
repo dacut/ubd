@@ -544,6 +544,7 @@ void UBDS3Volume::createVolume(
 {
     milliseconds sleep_time(100);
 
+    m_size = size;
     m_block_size = blockSize;
     m_encryption = encryption;
     m_policy = policy;
