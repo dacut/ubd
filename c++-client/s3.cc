@@ -570,7 +570,7 @@ void UBDS3Volume::createVolume(
     config.WriteReadable(*body);
     body->seekg(0);
 
-    S3Client s3(getS3Configuration());
+    S3Client s3(getS3Credentials(), getS3Configuration());
     PutObjectRequest req;
     req.SetBucket(m_bucket_name);
     req.SetKey(m_devname + ".volinfo");
@@ -754,6 +754,12 @@ void UBDS3Volume::readBlock(
     req.SetBucket(m_bucket_name);
     req.SetKey(key);
 
+    {
+        ostringstream msg;
+        msg << std::this_thread::get_id() << ": blockToPrefix(" << block_id << ") -> " << key << "\n";
+        cerr << msg.str() << std::flush;
+    }
+
     while (true) {
         auto outcome = s3.GetObject(req);
 
@@ -816,6 +822,12 @@ void UBDS3Volume::writeBlock(
     String key = blockToPrefix(block_id) + m_suffix;
 
     shared_ptr<stringstream> body(new stringstream);
+
+    {
+        ostringstream msg;
+        msg << std::this_thread::get_id() << ": blockToPrefix(" << block_id << ") -> " << key << "\n";
+        cerr << msg.str() << std::flush;
+    }
 
     body->rdbuf()->pubsetbuf(
         const_cast<char *>(static_cast<char const *>(buffer)), m_block_size);
