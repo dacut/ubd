@@ -946,7 +946,9 @@ void UBDS3Handler::run() {
 
         if (poll_result > 0) {
             // Event ready.
-            cerr << "Thread " << std::this_thread::get_id() << " processing a message" << endl;
+            stringstream msg;
+            msg << "Thread " << std::this_thread::get_id() << " processing a message" << "\n";
+            cerr << msg.str() << std::flush;
 
             while (true) {
                 try {
