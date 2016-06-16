@@ -21,7 +21,7 @@
 #include "s3.hh"
 #include "regionmap.hh"
 
-#define INITIAL_BUFFER_SIZE (4096)
+#define INITIAL_BUFFER_SIZE (256u << 20)
 
 using std::chrono::milliseconds;
 using std::chrono::seconds;
@@ -653,6 +653,13 @@ void UBDS3Volume::read(
     uint64_t end_offset = (offset + length) % m_block_size;
     uint8_t *p = static_cast<uint8_t *>(buffer);
 
+    {
+        lock_guard<mutex> lock(m_mutex);
+        FILE *fp = fopen("/tmp/ubds3.audit", "a");
+        fprintf(fp, "read %llu-%llu\n", (unsigned long long) offset, (unsigned long long) offset + length);
+        fclose(fp);
+    }
+
     for (uint64_t i = start_block; i < end_block; ++i) {
         readBlock(s3, i, p);
 
@@ -688,6 +695,13 @@ void UBDS3Volume::write(
     uint64_t end_block = (offset + length) / m_block_size;
     uint64_t end_offset = (offset + length) % m_block_size;
     const uint8_t *p = static_cast<const uint8_t *>(buffer);
+
+    {
+        lock_guard<mutex> lock(m_mutex);
+        FILE *fp = fopen("/tmp/ubds3.audit", "a");
+        fprintf(fp, "write %llu-%llu\n", (unsigned long long) offset, (unsigned long long) offset + length);
+        fclose(fp);
+    }
 
     if (start_offset > 0) {
         // We need a read-modify-write cycle at the start.
@@ -817,10 +831,11 @@ void UBDS3Volume::readBlock(
             {
                 lock_guard<mutex> lock(m_mutex);
                 FILE *fp = fopen("/tmp/ubds3.audit", "a");
-                fprintf(fp, "readBlock %" PRIu64 "\n", block_id);
+                fprintf(fp, "readBlock %llu\n", (unsigned long long) block_id);
                 for (size_t i = 0; i < m_block_size; i += 16) {
-                    for (size_t j = 0; j < i + 16; ++j) {
-                        fprintf(fp, "%02x", ((unsigned char *)buffer)[j]);
+                    fprintf(fp, "%08zx:", i);
+                    for (size_t j = i; j < i + 16; ++j) {
+                        fprintf(fp, " %02x", ((unsigned char *)buffer)[j]);
                     }
                     
                     fprintf(fp, "\n");
@@ -839,6 +854,12 @@ void UBDS3Volume::readBlock(
             ecode == S3Errors::NO_SUCH_KEY)
         {
             // Never-written block. Return all zeroes.
+            {
+                lock_guard<mutex> lock(m_mutex);
+                FILE *fp = fopen("/tmp/ubds3.audit", "a");
+                fprintf(fp, "readBlock %llu\n", (unsigned long long) block_id);
+                fprintf(fp, "-- not present --\n");
+            }
             memset(buffer, 0, m_block_size);
             return;
         }
@@ -881,10 +902,12 @@ void UBDS3Volume::writeBlock(
         lock_guard<mutex> lock(m_mutex);
         FILE *fp = fopen("/tmp/ubds3.audit", "a");
 
-        fprintf(fp, "writeBlock %" PRIu64 "\n", block_id);
+        fprintf(fp, "writeBlock %llu\n", (unsigned long long) block_id);
         for (size_t i = 0; i < m_block_size; i += 16) {
-            for (size_t j = 0; j < i + 16; ++j) {
-                fprintf(fp, "%02x", ((unsigned char *)buffer2)[j]);
+            fprintf(fp, "%08zx:", i);
+
+            for (size_t j = i; j < i + 16; ++j) {
+                fprintf(fp, " %02x", ((unsigned char *)buffer2)[j]);
             }
 
             fprintf(fp, "\n");
@@ -892,11 +915,11 @@ void UBDS3Volume::writeBlock(
         
         fclose(fp);
     }
-    delete [] buffer2;
 
     if (std::memcmp(buffer, buffer2, m_block_size) != 0) {
         cerr << "buffer and buffer2 differ" << endl;
     }
+    delete [] buffer2;
     body->seekg(0);
 
     req.SetBucket(m_bucket_name);
