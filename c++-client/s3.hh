@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -70,6 +71,8 @@ public:
     bool isStopRequested() { return m_stop_requested.load(); }
     void requestStop() { m_stop_requested.store(true); }
 
+    std::mutex& getMutex() { return m_mutex; }
+
     static Aws::String blockToPrefix(uint64_t block_index);
 
 protected:
@@ -103,8 +106,8 @@ private:
     uint64_t m_size;
     uint32_t m_major;
     std::atomic_bool m_stop_requested;
-
     Aws::Utils::Array<std::thread> m_threads;
+    std::mutex m_mutex;
 };
 
 class UBDS3Handler {

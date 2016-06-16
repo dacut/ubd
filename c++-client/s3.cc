@@ -1,8 +1,12 @@
+#define __STDC_FORMAT_MACROS
 #include <cerrno>
 #include <climits>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 
 #include <getopt.h>
@@ -28,10 +32,15 @@ using std::cout;
 using std::domain_error;
 using std::endl;
 using std::exception;
+using std::fclose;
+using std::fopen;
+using std::fprintf;
+using std::lock_guard;
 using std::map;
 using std::memcpy;
 using std::memmove;
 using std::move;
+using std::mutex;
 using std::ostream;
 using std::ostringstream;
 using std::shared_ptr;
@@ -449,7 +458,8 @@ UBDS3Volume::UBDS3Volume(
     m_size(0ull),
     m_major(0),
     m_stop_requested(false),
-    m_threads(thread_count)
+    m_threads(thread_count),
+    m_mutex()
 {
     return;
 }
@@ -804,6 +814,21 @@ void UBDS3Volume::readBlock(
                 throw UBDError(message, EIO);
             }
 
+            {
+                lock_guard<mutex> lock(m_mutex);
+                FILE *fp = fopen("/tmp/ubds3.audit", "a");
+                fprintf(fp, "readBlock %" PRIu64 "\n", block_id);
+                for (size_t i = 0; i < m_block_size; i += 16) {
+                    for (size_t j = 0; j < i + 16; ++j) {
+                        fprintf(fp, "%02x", ((unsigned char *)buffer)[j]);
+                    }
+                    
+                    fprintf(fp, "\n");
+                }
+                
+                fclose(fp);
+            }
+
             return;
         }
         
@@ -842,11 +867,37 @@ void UBDS3Volume::writeBlock(
     PutObjectRequest req;
     milliseconds sleep_time(100);
     String key = blockToPrefix(block_id) + m_suffix;
+    char *buffer2;
 
     shared_ptr<stringstream> body(new stringstream);
 
     body->rdbuf()->pubsetbuf(
         const_cast<char *>(static_cast<char const *>(buffer)), m_block_size);
+
+    buffer2 = new char[m_block_size];
+    body->read(buffer2, m_block_size);
+
+    {
+        lock_guard<mutex> lock(m_mutex);
+        FILE *fp = fopen("/tmp/ubds3.audit", "a");
+
+        fprintf(fp, "writeBlock %" PRIu64 "\n", block_id);
+        for (size_t i = 0; i < m_block_size; i += 16) {
+            for (size_t j = 0; j < i + 16; ++j) {
+                fprintf(fp, "%02x", ((unsigned char *)buffer2)[j]);
+            }
+
+            fprintf(fp, "\n");
+        }
+        
+        fclose(fp);
+    }
+    delete [] buffer2;
+
+    if (std::memcmp(buffer, buffer2, m_block_size) != 0) {
+        cerr << "buffer and buffer2 differ" << endl;
+    }
+    body->seekg(0);
 
     req.SetBucket(m_bucket_name);
     req.SetKey(key);
