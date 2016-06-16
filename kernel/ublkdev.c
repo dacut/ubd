@@ -378,9 +378,8 @@ static void ubd_teardown(void) {
         // Remove this device from the list of devices.
         list_del(el);
 
-        ubd_debug("Failing requests.");
-        
         // Fail all requests on this device.
+        ubd_debug("Failing requests.");
         ubd_fail_requests(dev, lock_flags);
 
         ubd_debug("Notifying waiters about status change.");
@@ -742,22 +741,18 @@ static long ubdctl_ioctl_unregister(
     mutex_unlock(&ubd_devices_lock);
 
     // Fail all requests on this device.
+    // We can't hold the device lock when cleaning the queue.
+    // This checks out the request lock, and the lock order is always
+    // request_lock -> device_lock
+    spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     ubd_debug("Failing all requests.");
     ubd_fail_requests(dev, lock_flags);
+    spin_lock_irqsave(&dev->wait.lock, lock_flags);
 
     // Notify anyone waiting on a status change.
     ubd_debug("Notifying waiters.");
     smp_wmb();
     wake_up_all_locked(&dev->wait);
-
-    // We can't hold the device lock when cleaning the queue.
-    // This checks out the request lock, and the lock order is always
-    // request_lock -> device_lock
-    //spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
-    //ubd_debug("Cleaning the request queue.");
-    //BUG_ON(dev->in_flight == NULL);
-    //blk_cleanup_queue(dev->in_flight);
-    //spin_lock_irqsave(&dev->wait.lock, lock_flags);
 
     if (ACCESS_ONCE(dev->n_control_handles) == 0 &&
         ACCESS_ONCE(dev->n_block_handles) == 0)

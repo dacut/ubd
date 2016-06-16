@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -34,15 +35,19 @@ using std::endl;
 using std::exception;
 using std::fclose;
 using std::fopen;
-using std::fprintf;
+using std::hex;
+using std::ios_base;
 using std::lock_guard;
 using std::map;
 using std::memcpy;
 using std::memmove;
 using std::move;
 using std::mutex;
+using std::ofstream;
 using std::ostream;
 using std::ostringstream;
+using std::setfill;
+using std::setw;
 using std::shared_ptr;
 using std::strcmp;
 using std::strerror;
@@ -426,7 +431,17 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        vol.registerVolume();
+        try {
+            vol.registerVolume();
+        }
+        catch (UBDError &e) {
+            cerr << "Unable to register volume: " << e.what() << endl;
+            cerr << "Make sure the ublkdev.ko module is loaded into the "
+                 << "kernel." << endl;
+            Aws::ShutdownAPI(sdk_options);
+            return 1;
+        }
+
         vol.run();
 
         Aws::ShutdownAPI(sdk_options);
@@ -655,9 +670,14 @@ void UBDS3Volume::read(
 
     {
         lock_guard<mutex> lock(m_mutex);
-        FILE *fp = fopen("/tmp/ubds3.audit", "a");
-        fprintf(fp, "read %llu-%llu\n", (unsigned long long) offset, (unsigned long long) offset + length);
-        fclose(fp);
+        auto fp = ofstream("/tmp/ubds3.audit", ios_base::out | ios_base::app);
+        fp << std::this_thread::get_id()
+           << " read " << offset << '-' << (offset + length)
+           << " start_block=" << start_block 
+           << " start_offset=" << start_offset
+           << " end_block=" << end_block 
+           << " end_offset=" << end_offset
+           << '\n';
     }
 
     for (uint64_t i = start_block; i < end_block; ++i) {
@@ -698,9 +718,14 @@ void UBDS3Volume::write(
 
     {
         lock_guard<mutex> lock(m_mutex);
-        FILE *fp = fopen("/tmp/ubds3.audit", "a");
-        fprintf(fp, "write %llu-%llu\n", (unsigned long long) offset, (unsigned long long) offset + length);
-        fclose(fp);
+        auto fp = ofstream("/tmp/ubds3.audit", ios_base::out | ios_base::app);
+        fp << std::this_thread::get_id()
+           << " write " << offset << '-' << (offset + length)
+           << " start_block=" << start_block 
+           << " start_offset=" << start_offset
+           << " end_block=" << end_block 
+           << " end_offset=" << end_offset
+           << '\n';
     }
 
     if (start_offset > 0) {
@@ -803,6 +828,7 @@ void UBDS3Volume::readBlock(
 
     {
         ostringstream msg;
+        msg << "readBlock " << block_id << endl;
         cerr << msg.str() << std::flush;
     }
 
@@ -830,18 +856,21 @@ void UBDS3Volume::readBlock(
 
             {
                 lock_guard<mutex> lock(m_mutex);
-                FILE *fp = fopen("/tmp/ubds3.audit", "a");
-                fprintf(fp, "readBlock %llu\n", (unsigned long long) block_id);
+                auto fp = ofstream("/tmp/ubds3.audit",
+                                   ios_base::out | ios_base::app);
+
+                fp << std::this_thread::get_id()
+                   << " readBlock " << block_id << '\n';
                 for (size_t i = 0; i < m_block_size; i += 16) {
-                    fprintf(fp, "%08zx:", i);
+                    fp << setw(8) << setfill('0') << hex << i;
+
                     for (size_t j = i; j < i + 16; ++j) {
-                        fprintf(fp, " %02x", ((unsigned char *)buffer)[j]);
+                        fp << ' ' << setw(2) << setfill('0') << hex
+                           << (unsigned int)(((unsigned char *) buffer)[j]);
                     }
-                    
-                    fprintf(fp, "\n");
+
+                    fp << '\n';
                 }
-                
-                fclose(fp);
             }
 
             return;
@@ -856,9 +885,11 @@ void UBDS3Volume::readBlock(
             // Never-written block. Return all zeroes.
             {
                 lock_guard<mutex> lock(m_mutex);
-                FILE *fp = fopen("/tmp/ubds3.audit", "a");
-                fprintf(fp, "readBlock %llu\n", (unsigned long long) block_id);
-                fprintf(fp, "-- not present --\n");
+                auto fp = ofstream("/tmp/ubds3.audit",
+                                   ios_base::out | ios_base::app);
+                fp << std::this_thread::get_id()
+                   << " readBlock " << block_id
+                   << "\n-- not present --\n";
             }
             memset(buffer, 0, m_block_size);
             return;
@@ -900,20 +931,20 @@ void UBDS3Volume::writeBlock(
 
     {
         lock_guard<mutex> lock(m_mutex);
-        FILE *fp = fopen("/tmp/ubds3.audit", "a");
+        auto fp = ofstream("/tmp/ubds3.audit", ios_base::out | ios_base::app);
 
-        fprintf(fp, "writeBlock %llu\n", (unsigned long long) block_id);
+        fp << std::this_thread::get_id()
+           << " writeBlock " << block_id << '\n';
         for (size_t i = 0; i < m_block_size; i += 16) {
-            fprintf(fp, "%08zx:", i);
+            fp << setw(8) << setfill('0') << hex << i;
 
             for (size_t j = i; j < i + 16; ++j) {
-                fprintf(fp, " %02x", ((unsigned char *)buffer2)[j]);
+                fp << ' ' << setw(2) << setfill('0') << hex
+                   << (unsigned int)(((unsigned char *) buffer2)[j]);
             }
 
-            fprintf(fp, "\n");
+            fp << '\n';
         }
-        
-        fclose(fp);
     }
 
     if (std::memcmp(buffer, buffer2, m_block_size) != 0) {
