@@ -44,12 +44,10 @@ UserBlockDevice::~UserBlockDevice()
 }
 
 struct ubd_info UserBlockDevice::registerEndpoint(
-        const char *name,
         ssize_t n_sectors,
         bool read_only)
 {
     struct ubd_info ui;
-    strncpy(ui.ubd_name, name, UBD_DISK_NAME_LEN);
     ui.ubd_flags = (read_only ? UBD_FL_READ_ONLY : 0u);
     ui.ubd_major = 0u;
     ui.ubd_nsectors = n_sectors;

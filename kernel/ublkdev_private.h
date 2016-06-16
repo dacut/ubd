@@ -111,6 +111,12 @@ struct ublkdev {
      *  @c ubd_devices_lock and @wait.lock must be held to modify this.
      */
     uint32_t n_block_handles;
+
+    /** The index number of this device.
+     *
+     *  Index 0 corresponds to ubda, 1 to ubdb, etc.
+     */
+    uint32_t device_index;
 };
 
 /** Emit a debug message. */

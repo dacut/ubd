@@ -152,7 +152,7 @@ static void ubd_fail_requests(struct ublkdev *dev, unsigned long lock_flags) {
             ACCESS_ONCE(dev->pending_delivery_tail) = NULL;
         }
 
-        unfinished = blk_end_request_err(req, -EIO);
+        unfinished = blk_end_request_err(req, -ENODEV);
         BUG_ON(unfinished);
     }
 
@@ -166,7 +166,7 @@ static void ubd_fail_requests(struct ublkdev *dev, unsigned long lock_flags) {
             ACCESS_ONCE(dev->n_pending_reply) = n_pending_reply;
             ACCESS_ONCE(dev->pending_reply[i]) = NULL;
             
-            unfinished = blk_end_request_err(req, -EIO);
+            unfinished = blk_end_request_err(req, -ENODEV);
             BUG_ON(unfinished);
         }
     }
@@ -544,10 +544,11 @@ static long ubdctl_ioctl_register(
     unsigned long data)
 {
     struct ubd_info info;
-    size_t name_length;
     int major;
     struct ublkdev *dev;
     struct gendisk *disk;
+    struct list_head *el;
+    int next_index;
 
     /* Get the disk info from userspace. */
     if (copy_from_user(&info, (void *) data, sizeof(info)) != 0) {
@@ -555,23 +556,6 @@ static long ubdctl_ioctl_register(
         return -EFAULT;
     }
     
-    /* Make sure the name is NUL terminated. */
-    name_length = strnlen(info.ubd_name, DISK_NAME_LEN);
-    if (name_length == 0) {
-        ubd_notice("Name cannot be empty.");
-        return -EINVAL;
-    } else if (name_length >= DISK_NAME_LEN) {
-        ubd_notice("Name is not NUL terminated.");
-        return -EINVAL;
-    }
-
-    /* Register the new block device. */
-    if ((major = register_blkdev(0, info.ubd_name)) < 0) {
-        ubd_notice("Failed to register %s: error code %d.\n", info.ubd_name,
-                   -major);
-        return major;
-    }
-
     /* Allocate the block device structure.  Require this to reside in RAM so
      * we don't end up swapping to another (possibly this?) ublkdev.
      */
@@ -579,7 +563,6 @@ static long ubdctl_ioctl_register(
     if (dev == NULL) {
         ubd_err("Failed to allocate %zu bytes for struct ublkdev.",
                 sizeof(*dev));
-        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
 
@@ -590,7 +573,6 @@ static long ubdctl_ioctl_register(
         ubd_err("Failed to allocate %zu bytes for reply array.",
                 UBD_INITIAL_PENDING_REPLY_SIZE);
         kfree(dev);
-        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
     dev->max_pending_reply = UBD_INITIAL_PENDING_REPLY_CAPACITY;
@@ -603,7 +585,6 @@ static long ubdctl_ioctl_register(
         ubd_err("Failed to allocate block request queue.");
         kfree(dev->pending_reply);
         kfree(dev);
-        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
     
@@ -617,14 +598,12 @@ static long ubdctl_ioctl_register(
         blk_cleanup_queue(dev->in_flight);
         kfree(dev->pending_reply);
         kfree(dev);
-        unregister_blkdev(major, info.ubd_name);
         return -ENOMEM;
     }
 
     // Initialize the rest of the gendisk structure.
-    disk->major = major;
+    disk->major = 0; // Until we can allocate a major.
     disk->first_minor = 0;
-    memcpy(disk->disk_name, info.ubd_name, DISK_NAME_LEN);
     disk->devnode = ubdblk_get_devnode;
     disk->fops = &ubdblk_fops;
     disk->queue = dev->in_flight;
@@ -651,6 +630,52 @@ static long ubdctl_ioctl_register(
     ubd_debug("Registering %s with %llu sectors", info.ubd_name,
               (long long unsigned) info.ubd_nsectors);
 
+    /* Add this device to the global list of devices. */
+    next_index = 0;
+    dev->device_index = ~0u;
+
+    mutex_lock(&ubd_devices_lock);
+    list_for_each(el, &ubd_devices) {
+        struct ublkdev *compare_dev = list_entry(el, struct ublkdev, list);
+
+        BUG_ON(compare_dev->device_index < next_index);
+
+        if (compare_dev->device_index != next_index) {
+            // Found an empty slot for this disk.  Add it before the device
+            // we're comparing against.
+            dev->device_index = next_index;
+            list_add(&dev->list, compare_dev->list.prev);
+            break;
+        }
+
+        ++next_index;
+    }
+
+    // Did we find a slot?
+    if (dev->device_index == ~0u) {
+        // Nope; add it to the end.
+        dev->device_index = next_index;
+        list_add_tail(& dev->list, &ubd_devices);
+    }
+
+    sprintf(info.ubd_name, "ubd%c", 'a' + dev->device_index);
+    memcpy(disk->disk_name, info.ubd_name, DISK_NAME_LEN);
+
+    /* Register the new block device. */
+    if ((major = register_blkdev(0, info.ubd_name)) < 0) {
+        ubd_notice("Failed to register %s: error code %d.\n", info.ubd_name,
+                   -major);
+        list_del(&dev->list);
+        blk_cleanup_queue(dev->in_flight);
+        kfree(dev->pending_reply);
+        kfree(dev);
+        
+        return major;
+    }
+
+    info.ubd_major = disk->major = major;
+    mutex_unlock(&ubd_devices_lock);
+
     // Flush everything before the work function might start.
     smp_wmb();
 
@@ -662,13 +687,7 @@ static long ubdctl_ioctl_register(
 
     smp_wmb();
 
-    /* Add this device to the global list of devices. */
-    mutex_lock(&ubd_devices_lock);
-    list_add_tail(& dev->list, &ubd_devices);
-    mutex_unlock(&ubd_devices_lock);
-
-    /* Copy the major number back to user space. */
-    info.ubd_major = major;
+    // Copy the disk information back to userspace.
     if (copy_to_user((void *) data, &info, sizeof(info))) {
         ubd_err("Userspace structure became invalid.");
         return -EFAULT;
@@ -712,7 +731,7 @@ static long ubdctl_ioctl_unregister(
         mutex_unlock(&ubd_devices_lock);
         return -EINVAL;
     }
-    
+
     ubd_debug("Setting status to terminated.");
     // Start the unregister process.
     ACCESS_ONCE(dev->status) = UBD_STATUS_TERMINATED;
@@ -730,6 +749,15 @@ static long ubdctl_ioctl_unregister(
     ubd_debug("Notifying waiters.");
     smp_wmb();
     wake_up_all_locked(&dev->wait);
+
+    // We can't hold the device lock when cleaning the queue.
+    // This checks out the request lock, and the lock order is always
+    // request_lock -> device_lock
+    //spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+    //ubd_debug("Cleaning the request queue.");
+    //BUG_ON(dev->in_flight == NULL);
+    //blk_cleanup_queue(dev->in_flight);
+    //spin_lock_irqsave(&dev->wait.lock, lock_flags);
 
     if (ACCESS_ONCE(dev->n_control_handles) == 0 &&
         ACCESS_ONCE(dev->n_block_handles) == 0)
@@ -1286,7 +1314,7 @@ static long ubdctl_ioctl_debug(
 
 
 static char *ubdblk_get_devnode(struct gendisk *gd, umode_t *mode) {
-    return kasprintf(GFP_KERNEL, "ubd/%s", gd->disk_name);
+    return kasprintf(GFP_KERNEL, "%s", gd->disk_name);
 }
 
 
@@ -1419,30 +1447,41 @@ static void ubdblk_handle_request(struct request_queue *rq) {
     BUG_ON(dev == NULL);
 
     while ((req = blk_fetch_request(rq)) != NULL) {
+        ubd_debug("About to acquire device lock; queue lock is %s, device lock is %s",
+                  (spin_is_locked(rq->queue_lock) ? "locked" : "unlocked"),
+                  (spin_is_locked(&dev->wait.lock) ? "locked" : "unlocked"));
         spin_lock_irqsave(&dev->wait.lock, lock_flags);
         status = dev->status;
 
-        ubd_debug("Handling a request");
+        ubd_debug("Device lock acquired; handling a request");
 
         if (unlikely(status == UBD_STATUS_TERMINATED)) {
             // Device is not running; fail the request.
+            spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+
             ubd_warning("Received a request for a non-running device.");
-            unfinished = blk_end_request_err(req, -EIO);
+            spin_unlock_irq(rq->queue_lock);
+            unfinished = blk_end_request_err(req, -ENODEV);
             BUG_ON(unfinished);
+            spin_lock_irq(rq->queue_lock);
         } else {
             switch (req->cmd_type) {
             case REQ_TYPE_FS:
                 ubdblk_handle_fs_request(dev, req);
+                spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
                 break;
 
             default:
+                spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
                 ubd_err("Unknown request type 0x%x", req->cmd_type);
+                spin_unlock_irq(rq->queue_lock);
                 unfinished = blk_end_request_err(req, -EIO);
                 BUG_ON(unfinished);
+                spin_lock_irq(rq->queue_lock);
                 break;
             }
+
         }
-        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
     }
 
     return;
@@ -1475,6 +1514,7 @@ static void ubdblk_handle_fs_request(
     }
 
     req->special = NULL;
+    ubd_debug("Notifying all waiters");
     wake_up_all_locked(&dev->wait);
     return;
 }

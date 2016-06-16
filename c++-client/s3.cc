@@ -27,6 +27,7 @@ using std::clog;
 using std::cout;
 using std::domain_error;
 using std::endl;
+using std::exception;
 using std::map;
 using std::memcpy;
 using std::memmove;
@@ -341,10 +342,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    String devname = argv[optind];
+    String volname = argv[optind];
     
     if (create && suffix.length() == 0) {
-        suffix = "." + devname;
+        suffix = "." + volname;
     }
 
     sdk_options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
@@ -371,31 +372,52 @@ int main(int argc, char *argv[]) {
             client_config.proxyPort = proxy_port;
         }
 
-        shared_ptr<AWSCredentialsProvider> creds;
+        shared_ptr<AWSCredentialsProvider> cred_provider;
 
         if (profile) {
             cerr << "Using ProfileConfigFileAWSCredentialsProvider" << endl;
-            creds = shared_ptr<AWSCredentialsProvider>(
-                new ProfileConfigFileAWSCredentialsProvider(profile->c_str()));
+            cred_provider = shared_ptr<AWSCredentialsProvider>(
+                new ProfileConfigFileAWSCredentialsProvider(profile->c_str()));            
         }
         else if (getenv("AWS_ACCESS_KEY_ID") != nullptr &&
                  getenv("AWS_SECRET_ACCESS_KEY") != nullptr)
         {
-            creds = shared_ptr<AWSCredentialsProvider>(
+            cred_provider = shared_ptr<AWSCredentialsProvider>(
                 new EnvironmentAWSCredentialsProvider);
         }
         else {
-            creds = shared_ptr<AWSCredentialsProvider>(
+            cred_provider = shared_ptr<AWSCredentialsProvider>(
                 new InstanceProfileCredentialsProvider);
         }
 
-        UBDS3Volume vol(bucket_name, devname, creds, client_config,
+        auto const &creds = cred_provider->GetAWSCredentials();
+        cerr << "Using access key " << creds.GetAWSAccessKeyId() << endl;
+        cerr << "Using secret key " << creds.GetAWSSecretKey() << endl;
+
+        cerr << "Using access key " << creds.GetAWSAccessKeyId() << endl;
+        cerr << "Using secret key " << creds.GetAWSSecretKey() << endl;
+
+        UBDS3Volume vol(bucket_name, volname, cred_provider, client_config,
                         thread_count);
         if (create) {
-            vol.createVolume(size, block_size, sse, policy, storage_class,
-                             suffix);
+            try {
+                vol.createVolume(size, block_size, sse, policy, storage_class,
+                                 suffix);
+            }
+            catch (exception &e) {
+                cerr << "Failed to create volume: " << e.what() << endl;
+                Aws::ShutdownAPI(sdk_options);
+                return 1;
+            }
         } else {
-            vol.readVolumeInfo();
+            try {
+                vol.readVolumeInfo();
+            }
+            catch (exception &e) {
+                cerr << "Failed to read volume: " << e.what() << endl;
+                Aws::ShutdownAPI(sdk_options);
+                return 1;
+            }
         }
 
         vol.registerVolume();
@@ -412,13 +434,13 @@ int main(int argc, char *argv[]) {
 
 UBDS3Volume::UBDS3Volume(
     String const &bucket_name,
-    String const &devname,
+    String const &volume_name,
     shared_ptr<AWSCredentialsProvider> &auth,
     ClientConfiguration const &client_config,
     uint32_t thread_count) :
     m_ubd(NULL),
     m_bucket_name(bucket_name),
-    m_devname(devname),
+    m_volume_name(volume_name),
     m_auth(auth),
     m_client_config(client_config),
     m_thread_count(thread_count),
@@ -444,8 +466,12 @@ void UBDS3Volume::registerVolume() {
     uint64_t n_sectors = m_size / 512;
     
     m_ubd = new UserBlockDevice();
-    auto ui = m_ubd->registerEndpoint(m_devname.c_str(), n_sectors, false);
+    auto ui = m_ubd->registerEndpoint(n_sectors, false);
+    m_device_name = ui.ubd_name;
     m_major = ui.ubd_major;
+
+    cout << "Volume " << m_volume_name << " registered as /dev/"
+         << m_device_name << " with major " << m_major << endl;
     return;
 }
 
@@ -471,7 +497,7 @@ void UBDS3Volume::readVolumeInfo() {
     S3Client s3(getS3Credentials(), getS3Configuration());
     GetObjectRequest req;
     req.SetBucket(m_bucket_name);
-    req.SetKey(m_devname + ".volinfo");
+    req.SetKey(m_volume_name + ".volinfo");
     
     while (true) {
         auto outcome = s3.GetObject(req);
@@ -483,7 +509,7 @@ void UBDS3Volume::readVolumeInfo() {
             JsonValue config(body);
             if (! config.WasParseSuccessful()) {
                 clog << "Invalid JSON in s3://" << m_bucket_name << "/"
-                     << m_devname << ".volinfo: "
+                     << m_volume_name << ".volinfo: "
                      << config.GetErrorMessage() << endl;
                 throw UBDError(EINVAL);
             }
@@ -526,7 +552,7 @@ void UBDS3Volume::readVolumeInfo() {
         string message("Failed to read s3://");
         message += m_bucket_name.c_str();
         message += '/';
-        message += m_devname.c_str();
+        message += m_volume_name.c_str();
         message += ".volinfo: ";
         message += getNameForS3Error(ecode).c_str();
 
@@ -573,7 +599,7 @@ void UBDS3Volume::createVolume(
     S3Client s3(getS3Credentials(), getS3Configuration());
     PutObjectRequest req;
     req.SetBucket(m_bucket_name);
-    req.SetKey(m_devname + ".volinfo");
+    req.SetKey(m_volume_name + ".volinfo");
     req.SetACL(m_policy);
     req.SetStorageClass(m_storage_class);
     req.SetBody(body);
@@ -600,7 +626,7 @@ void UBDS3Volume::createVolume(
         string message("Failed to write s3://");
         message += m_bucket_name.c_str();
         message += '/';
-        message += m_devname.c_str();
+        message += m_volume_name.c_str();
         message += ".volinfo: ";
         message += getNameForS3Error(ecode).c_str();
 
@@ -756,7 +782,6 @@ void UBDS3Volume::readBlock(
 
     {
         ostringstream msg;
-        msg << std::this_thread::get_id() << ": blockToPrefix(" << block_id << ") -> " << key << "\n";
         cerr << msg.str() << std::flush;
     }
 
@@ -822,12 +847,6 @@ void UBDS3Volume::writeBlock(
     String key = blockToPrefix(block_id) + m_suffix;
 
     shared_ptr<stringstream> body(new stringstream);
-
-    {
-        ostringstream msg;
-        msg << std::this_thread::get_id() << ": blockToPrefix(" << block_id << ") -> " << key << "\n";
-        cerr << msg.str() << std::flush;
-    }
 
     body->rdbuf()->pubsetbuf(
         const_cast<char *>(static_cast<char const *>(buffer)), m_block_size);
@@ -912,7 +931,7 @@ UBDS3Handler::UBDS3Handler(UBDS3Volume *volume) :
     m_message(),
     m_buffer(new uint8_t[INITIAL_BUFFER_SIZE]),
     m_buffer_size(INITIAL_BUFFER_SIZE),
-    m_s3(volume->getS3Configuration())
+    m_s3(volume->getS3Credentials(), volume->getS3Configuration())
 {
     m_message.ubd_data = m_buffer.get();
     m_ubd.tie(m_volume->getMajor());
@@ -958,9 +977,9 @@ void UBDS3Handler::run() {
 
         if (poll_result > 0) {
             // Event ready.
-            stringstream msg;
-            msg << "Thread " << std::this_thread::get_id() << " processing a message" << "\n";
-            cerr << msg.str() << std::flush;
+            //stringstream msg;
+            //msg << "Thread " << std::this_thread::get_id() << " processing a message" << "\n";
+            //cerr << msg.str() << std::flush;
 
             while (true) {
                 try {
@@ -1016,9 +1035,20 @@ void UBDS3Handler::handleUBDRequest() {
             }
         }
 
-        m_volume->read(m_s3, offset, m_message.ubd_data, length);
-        m_message.ubd_status = m_message.ubd_size = length;
-        m_ubd.putReply(m_message);
+        try {
+            m_volume->read(m_s3, offset, m_message.ubd_data, length);
+            m_message.ubd_status = m_message.ubd_size = length;
+            m_ubd.putReply(m_message);
+        }
+        catch (exception &e) {
+            ostringstream msg;
+            msg << std::this_thread::get_id()
+                << ": read from " << offset << " to " << offset + length
+                << " failed: " << e.what() << endl;
+            cerr << msg.str();
+            m_message.ubd_status = -EIO;
+            m_ubd.putReply(m_message);
+        }
         break;
 
     case UBD_MSGTYPE_WRITE:
@@ -1026,10 +1056,21 @@ void UBDS3Handler::handleUBDRequest() {
              << ": write (first_sector=" << m_message.ubd_first_sector
              << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
 
-        m_volume->write(m_s3, offset, m_message.ubd_data, length);
-        m_message.ubd_status = length;
-        m_message.ubd_size = 0;
-        m_ubd.putReply(m_message);
+        try {
+            m_volume->write(m_s3, offset, m_message.ubd_data, length);
+            m_message.ubd_status = length;
+            m_message.ubd_size = 0;
+            m_ubd.putReply(m_message);
+        }
+        catch (exception &e) {
+            ostringstream msg;
+            msg << std::this_thread::get_id()
+                << ": write from " << offset << " to " << offset + length
+                << " failed: " << e.what() << endl;
+            cerr << msg.str();
+            m_message.ubd_status = -EIO;
+            m_ubd.putReply(m_message);
+        }
         break;
 
     case UBD_MSGTYPE_DISCARD:
@@ -1037,10 +1078,21 @@ void UBDS3Handler::handleUBDRequest() {
              << ": discard (first_sector=" << m_message.ubd_first_sector
              << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
 
-        m_volume->trim(m_s3, offset, m_message.ubd_size);
-        m_message.ubd_status = length;
-        m_message.ubd_size = 0;
-        m_ubd.putReply(m_message);
+        try {
+            m_volume->trim(m_s3, offset, m_message.ubd_size);
+            m_message.ubd_status = length;
+            m_message.ubd_size = 0;
+            m_ubd.putReply(m_message);
+        }
+        catch (exception &e) {
+            ostringstream msg;
+            msg << std::this_thread::get_id()
+                << ": discard from " << offset << " to " << offset + length
+                << " failed: " << e.what() << endl;
+            cerr << msg.str();
+            m_message.ubd_status = -EIO;
+            m_ubd.putReply(m_message);
+        }
         break;
 
     case UBD_MSGTYPE_FLUSH:
@@ -1225,10 +1277,10 @@ static uint64_t parseSize(
 
 static void usage(ostream &os) {
     os << ("\
-Usage: ubds3 [options] <devname>\n\
+Usage: ubds3 [options] <volname>\n\
 \n\
-Create a block device backed by S3.  <devname> specifies the name of the\n\
-block device.\n\
+Create a block device backed by S3.  <volname> specifies the name of the\n\
+block volume.\n\
 \n\
 General options:\n\
     --bucket <name> | -b <name>\n\
@@ -1244,7 +1296,7 @@ General options:\n\
 Creating a new block device:\n\
     --create\n\
         Required to create a new block device.  This creates an object\n\
-        in the S3 bucket named <devname>.volinfo storing the below\n\
+        in the S3 bucket named <volname>.volinfo storing the below\n\
         configuration details.\n\
 \n\
     --encryption <policy> | -e <policy>\n\
@@ -1273,7 +1325,7 @@ Creating a new block device:\n\
         The suffixes are base-2.\n\
 \n\
     --suffix <string> | -S <string>\n\
-        Append the given suffix to object names.  This defaults to .<devname>.\n\
+        Append the given suffix to object names.  This defaults to .<volname>.\n\
         Object names are suffixed rather than prefixed to improve performance\n\
         (due to the way S3 partitions the bucket keyspace).\n\
 \n\

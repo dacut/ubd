@@ -20,7 +20,7 @@ class UBDS3Volume {
 public:
     UBDS3Volume(
         Aws::String const &bucket_name,
-        Aws::String const &devname,
+        Aws::String const &volume_name,
         std::shared_ptr<Aws::Auth::AWSCredentialsProvider> &auth,
         Aws::Client::ClientConfiguration const &client_config,
         uint32_t thread_count);
@@ -90,7 +90,8 @@ protected:
 private:
     UserBlockDevice *m_ubd;
     Aws::String m_bucket_name;
-    Aws::String m_devname;
+    Aws::String m_volume_name;
+    Aws::String m_device_name;
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> m_auth;
     Aws::Client::ClientConfiguration m_client_config;
     uint32_t m_thread_count;

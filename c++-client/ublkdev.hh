@@ -53,7 +53,6 @@ public:
     virtual ~UserBlockDevice();
 
     virtual struct ubd_info registerEndpoint(
-        const char *name,
         ssize_t n_sectors,
         bool read_only);
 
