@@ -394,9 +394,6 @@ int main(int argc, char *argv[]) {
         cerr << "Using access key " << creds.GetAWSAccessKeyId() << endl;
         cerr << "Using secret key " << creds.GetAWSSecretKey() << endl;
 
-        cerr << "Using access key " << creds.GetAWSAccessKeyId() << endl;
-        cerr << "Using secret key " << creds.GetAWSSecretKey() << endl;
-
         UBDS3Volume vol(bucket_name, volname, cred_provider, client_config,
                         thread_count);
         if (create) {
@@ -970,8 +967,10 @@ void UBDS3Handler::run() {
         int poll_result = poll(fds, 1, 1000);
 
         if (poll_result < 0) {
-            cerr << "Thread " << std::this_thread::get_id()
-                 << " failed to poll: " << strerror(errno) << endl;
+            ostringstream msg;
+            msg << "Thread " << std::this_thread::get_id()
+                << " failed to poll: " << strerror(errno) << endl;
+            cerr << msg.str();
             break;
         }
 
@@ -988,18 +987,30 @@ void UBDS3Handler::run() {
                     if (e.getError() == ENOMEM) {
                         // Resize the buffer
                         try {
-                            cerr << std::this_thread::get_id()
-                                 << ": ENOMEM -- allocated " << m_buffer_size
-                                 << " bytes but need " << m_message.ubd_size
-                                 << " bytes" << endl;
+                            {
+                                ostringstream msg;
+                                msg << std::this_thread::get_id()
+                                    << ": ENOMEM -- allocated " << m_buffer_size
+                                    << " bytes but need " << m_message.ubd_size
+                                    << " bytes" << endl;
+                                cerr << msg.str();
+                            }
+
                             resizeBuffer(m_message.ubd_size);
-                            cerr << std::this_thread::get_id()
-                                 << ": Now have " << m_buffer_size << " bytes" << endl;
+
+                            {
+                                ostringstream msg;
+                                msg << std::this_thread::get_id()
+                                    << ": Now have " << m_buffer_size << " bytes" << endl;
+                                cerr << msg.str();
+                            }
                         }
                         catch (bad_alloc &) {
-                            cerr << "Thread " << std::this_thread::get_id()
+                            ostringstream msg;
+                            msg << "Thread " << std::this_thread::get_id()
                                  << " failed to allocate " << message.ubd_size
                                  << " bytes; exiting." << endl;
+                            cerr << msg.str();
                             break;
                         }
                     }
