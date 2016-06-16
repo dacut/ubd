@@ -977,9 +977,6 @@ void UBDS3Handler::run() {
 
         if (poll_result > 0) {
             // Event ready.
-            //stringstream msg;
-            //msg << "Thread " << std::this_thread::get_id() << " processing a message" << "\n";
-            //cerr << msg.str() << std::flush;
 
             while (true) {
                 try {
@@ -1020,10 +1017,6 @@ void UBDS3Handler::handleUBDRequest() {
 
     switch (m_message.ubd_msgtype) {
     case UBD_MSGTYPE_READ:
-        cerr << "Thread " << std::this_thread::get_id()
-             << ": read (first_sector=" << m_message.ubd_first_sector
-             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
-
         if (length > m_buffer_size) {
             try {
                 resizeBuffer(length);
@@ -1052,10 +1045,6 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_WRITE:
-        cerr << "Thread " << std::this_thread::get_id()
-             << ": write (first_sector=" << m_message.ubd_first_sector
-             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
-
         try {
             m_volume->write(m_s3, offset, m_message.ubd_data, length);
             m_message.ubd_status = length;
@@ -1074,10 +1063,6 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_DISCARD:
-        cerr << "Thread " << std::this_thread::get_id()
-             << ": discard (first_sector=" << m_message.ubd_first_sector
-             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
-
         try {
             m_volume->trim(m_s3, offset, m_message.ubd_size);
             m_message.ubd_status = length;
@@ -1096,10 +1081,6 @@ void UBDS3Handler::handleUBDRequest() {
         break;
 
     case UBD_MSGTYPE_FLUSH:
-        cerr << "Thread " << std::this_thread::get_id()
-             << ": flush (first_sector=" << m_message.ubd_first_sector
-             << ", nsectors=" << m_message.ubd_nsectors << ")" << endl;
-
         m_message.ubd_status = length;
         m_message.ubd_size = 0;
         m_ubd.putReply(m_message);
