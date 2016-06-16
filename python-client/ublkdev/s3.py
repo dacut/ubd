@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 from __future__ import absolute_import, division, print_function
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from boto.exception import S3ResponseError
 import boto.s3
 from concurrent.futures import ThreadPoolExecutor
@@ -44,11 +43,15 @@ class UBDS3Handler(Thread):
     def run(self):
         volume = self.volume
 
-        while not volume.stop_requested:
-            ready_list = self.ubd.in_poll.poll(100)
-            if ready_list:
-                request = self.ubd.get_request(self.buffer)
-                self.handle_ubd_request(request, self.buffer)
+        try:
+            while not volume.stop_requested:
+                ready_list = self.ubd.in_poll.poll(1000)
+                if ready_list:
+                    log.info("Handling request")
+                    request = self.ubd.get_request(self.buffer)
+                    self.handle_ubd_request(request, self.buffer)
+        except OSError as e:
+            log.error("Failed to handle request; terminating.", exc_info=True)
         return
 
     def handle_ubd_request(self, msg, buf):
@@ -62,14 +65,17 @@ class UBDS3Handler(Thread):
 
         try:
             if req_type == UBD_MSGTYPE_READ:
+                log.info("Read request: %d-%d", offset, offset+length)
                 buf[:length] = self.volume.read(offset, length)
                 msg.ubd_size = length
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_WRITE:
+                log.info("Write request: %d-%d", offset, offset+length)
                 self.volume.write(offset, buf.raw[:length])
                 msg.ubd_size = 0
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_DISCARD:
+                log.info("Discard request: %d-%d", offset, offset+length)
                 self.volume.trim(offset, length)
                 msg.ubd_size = 0
                 msg.ubd_status = length
@@ -138,15 +144,15 @@ class UBDS3Volume(object):
     """
     A userspace block driver volume handler for S3-backed volumes.
     """
-    def __init__(self, bucket_name, devname, region, thread_count=1, s3_kw={}):
+    def __init__(self, bucket_name, volname, region, thread_count=1, s3_kw={}):
         """
-        UBDS3Volume(bucket_name, devname, region, thread_count=1, s3_kw={})
+        UBDS3Volume(bucket_name, volname, region, thread_count=1, s3_kw={})
               
         Create a new UBDS3Volume object.
         """
         super(UBDS3Volume, self).__init__()
         self.bucket_name = bucket_name
-        self.devname = devname
+        self.volname = volname
         self.region = region
         self.ubd = None
         self.thread_count = thread_count
@@ -168,12 +174,14 @@ class UBDS3Volume(object):
         """
         n_sectors = self.size // 512
 
-        log.info("Registering with UBD control endpoint as %r with %d sectors",
-                 self.devname, n_sectors)
-
         self.ubd = UserBlockDevice()
-        info = self.ubd.register(self.devname, n_sectors)
+        info = self.ubd.register(n_sectors)
+        self.devname = info.ubd_name
         self.major = info.ubd_major
+
+        log.info("Registered with UBD control endpoint as %r (major %d) "
+                 "with %d sectors", self.devname, self.major, n_sectors)
+
         return
 
     def run(self):
@@ -197,11 +205,11 @@ class UBDS3Volume(object):
         
     def read_volume_info(self):
         """
-        Read the devname.volinfo file in the S3 bucket.
+        Read the volname.volinfo file in the S3 bucket.
         """
         with self.s3_pool.get_connection() as s3:
             bucket = s3.get_bucket(self.bucket_name)
-            key = bucket.get_key(self.devname + ".volinfo")
+            key = bucket.get_key(self.volname + ".volinfo")
             config = json_loads(key.get_contents_as_string())
 
             self.block_size = int(config.get("block-size", 4096))
@@ -209,7 +217,7 @@ class UBDS3Volume(object):
             self.policy = config.get("policy", "private")
             self.size = int(config.get("size"))
             self.storage_class = config.get("storage-class", "standard")
-            self.suffix = config.get("suffix", "." + self.devname)
+            self.suffix = config.get("suffix", "." + self.volname)
 
         return
 
@@ -221,7 +229,7 @@ class UBDS3Volume(object):
         """
         with self.s3_pool.get_connection() as s3:
             bucket = s3.get_bucket(self.bucket_name)
-            key = bucket.new_key(self.devname + ".volinfo")
+            key = bucket.new_key(self.volname + ".volinfo")
 
             if size is None:
                 raise ValueError("size must be specified")
@@ -343,15 +351,21 @@ class UBDS3Volume(object):
 
         return
 
+    b64alphabet = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "0123456789-_")
+
     @staticmethod
     def block_to_prefix(block_index):
         """
         Convert a block index to an S3 key prefix.
         """
-        result = urlsafe_b64encode(pack("<Q", block_index))
-        assert len(result) == 12
-        assert result[-1] == '='
-        return result[:-1]
+        result = ""
+        for i in xrange(11):
+            result += UBDS3Volume.b64alphabet[block_index & 63]
+            block_index >>= 6
+
+        return result
 
     def get_key_for_block(self, bucket, block_id):
         """
@@ -595,9 +609,9 @@ def main(args=None):
         elif len(args) > 1:
             raise GetoptError("Unknown argument %r" % args[1])
         
-        devname = args[0]
+        volname = args[0]
         if create and suffix is None:
-            suffix = "." + devname
+            suffix = "." + volname
     except (GetoptError, ValueError) as e:
         print(str(e), file=stderr)
         usage()
@@ -608,7 +622,7 @@ def main(args=None):
     log = logging.getLogger("ubds3")
     logging.getLogger("boto").setLevel(logging.INFO)
 
-    volume = UBDS3Volume(bucket_name, devname, region=region,
+    volume = UBDS3Volume(bucket_name, volname, region=region,
                          thread_count=thread_count,
                          s3_kw={'profile_name': profile,
                                 'proxy_user': proxy_user,
@@ -628,10 +642,10 @@ def main(args=None):
 
 def usage(fd=stderr):
     fd.write("""\
-Usage: ubds3 [options] <devname>
+Usage: ubds3 [options] <volname>
 
-Create a block device backed by S3.  <devname> specifies the name of the
-block device.
+Create a block device backed by S3.  <volname> specifies the name of the
+block volume.
 
 General options:
     --bucket <name> | -b <name>
@@ -647,7 +661,7 @@ General options:
 Creating a new block device:
     --create
         Required to create a new block device.  This creates an object
-        in the S3 bucket named <devname>.volinfo storing the below
+        in the S3 bucket named <volname>.volinfo storing the below
         configuration details.
 
     --encryption <policy> | -e <policy>
@@ -676,7 +690,7 @@ Creating a new block device:
         The suffixes are base-2.
 
     --suffix <string> | -S <string>
-        Append the given suffix to object names.  This defaults to .<devname>.
+        Append the given suffix to object names.  This defaults to .<volname>.
         Object names are suffixed rather than prefixed to improve performance
         (due to the way S3 partitions the bucket keyspace).
 

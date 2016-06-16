@@ -926,7 +926,7 @@ static long ubdctl_ioctl_getrequest(
 {
     struct ublkdev *dev;
     unsigned long lock_flags;
-    struct request *req;
+    struct request *req = NULL;
     ubd_bvec_iter_t bvec;
     struct req_iterator iter;
     struct request *next_req;
@@ -955,15 +955,24 @@ static long ubdctl_ioctl_getrequest(
     // available.
     ubd_debug("About to enter spinlock to wait for a message");
     spin_lock_irqsave(&dev->wait.lock, lock_flags);
+
     if (wait_event_interruptible_locked(
             dev->wait,
-            (req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL &&
-            ACCESS_ONCE(dev->n_pending_reply) <
-            ACCESS_ONCE(dev->max_pending_reply)))
+            (ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED) || (
+                (req = ACCESS_ONCE(dev->pending_delivery_head)) != NULL &&
+                ACCESS_ONCE(dev->n_pending_reply) <
+                ACCESS_ONCE(dev->max_pending_reply))))
     {
         spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
         return -ERESTARTSYS;
     }
+
+    if (ACCESS_ONCE(dev->status) == UBD_STATUS_TERMINATED) {
+        ubd_debug("Device is terminated.");
+        spin_unlock_irqrestore(&dev->wait.lock, lock_flags);
+        return -ENODEV;
+    }
+
     ubd_debug("Message and tag available");
 
     msg.ubd_nsectors = blk_rq_sectors(req);

@@ -86,9 +86,8 @@ class UserBlockDevice(object):
         self.in_poll.register(self.control, select.POLLIN)
         return
 
-    def register(self, name, n_sectors, read_only=False):
+    def register(self, n_sectors, read_only=False):
         ubd_info = UBDInfo()
-        ubd_info.ubd_name = name
         ubd_info.ubd_nsectors = n_sectors
         ubd_info.ubd_flags = UBD_FL_READ_ONLY if read_only else 0
         ubd_info.ubd_major = 0
