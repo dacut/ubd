@@ -1218,7 +1218,7 @@ static long ubdctl_ioctl_putreply(
             dest = bvec_kmap_irq(ubd_bvptr(bvec), &bvec_irq_flags);
             src_len = ubd_bvptr(bvec)->bv_len;
             n_uncopied = copy_from_user(dest, src, src_len);
-            bvec_kunmap_irq(dest, &lock_flags);
+            bvec_kunmap_irq(dest, &bvec_irq_flags);
 
             if (n_uncopied > 0) {
                 ubd_warning("Failed to copy %ld bytes of %u total bytes from "

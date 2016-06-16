@@ -860,9 +860,9 @@ void UBDS3Volume::readBlock(
                                    ios_base::out | ios_base::app);
 
                 fp << std::this_thread::get_id()
-                   << " readBlock " << block_id << '\n';
+                   << " readBlock " << block_id << " (" << key << ")\n";
                 for (size_t i = 0; i < m_block_size; i += 16) {
-                    fp << setw(8) << setfill('0') << hex << i;
+                    fp << setw(8) << setfill('0') << hex << (i + m_block_size * block_id);
 
                     for (size_t j = i; j < i + 16; ++j) {
                         fp << ' ' << setw(2) << setfill('0') << hex
@@ -934,9 +934,9 @@ void UBDS3Volume::writeBlock(
         auto fp = ofstream("/tmp/ubds3.audit", ios_base::out | ios_base::app);
 
         fp << std::this_thread::get_id()
-           << " writeBlock " << block_id << '\n';
+           << " writeBlock " << block_id << " (" << key << ")\n";
         for (size_t i = 0; i < m_block_size; i += 16) {
-            fp << setw(8) << setfill('0') << hex << i;
+            fp << setw(8) << setfill('0') << hex << (i + m_block_size * block_id);
 
             for (size_t j = i; j < i + 16; ++j) {
                 fp << ' ' << setw(2) << setfill('0') << hex
