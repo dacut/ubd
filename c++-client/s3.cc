@@ -698,7 +698,12 @@ void UBDS3Volume::read(
     if (end_offset > 0) {
         unique_ptr<uint8_t[]> tmpbuf(new uint8_t[m_block_size]);
         readBlock(s3, end_block, tmpbuf.get());
-        memcpy(p, tmpbuf.get(), end_offset);
+
+        if (start_block == end_block) {
+            memcpy(p, tmpbuf.get() + start_offset, end_offset - start_offset);
+        } else {
+            memcpy(p, tmpbuf.get(), end_offset);
+        }
     }
 
     return;
@@ -1147,6 +1152,28 @@ void UBDS3Handler::handleUBDRequest() {
         try {
             m_volume->read(m_s3, offset, m_message.ubd_data, length);
             m_message.ubd_status = m_message.ubd_size = length;
+
+            {
+                lock_guard<mutex> lock(m_volume->getMutex());
+                auto fp = ofstream("/tmp/ubds3.audit",
+                                   ios_base::out | ios_base::app);
+
+                fp << std::this_thread::get_id()
+                   << " readReply offset=" << offset << " length=" << length
+                   << '\n';
+
+                for (size_t i = 0; i < length; i += 16) {
+                    fp << setw(8) << setfill('0') << hex << (i + offset);
+
+                    for (size_t j = i; j < i + 16; ++j) {
+                        fp << ' ' << setw(2) << setfill('0') << hex
+                           << (unsigned int)(((unsigned char *) m_message.ubd_data)[j]);
+                    }
+
+                    fp << '\n';
+                }
+            }
+
             m_ubd.putReply(m_message);
         }
         catch (exception &e) {

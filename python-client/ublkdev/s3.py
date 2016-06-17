@@ -47,7 +47,6 @@ class UBDS3Handler(Thread):
             while not volume.stop_requested:
                 ready_list = self.ubd.in_poll.poll(1000)
                 if ready_list:
-                    log.info("Handling request")
                     request = self.ubd.get_request(self.buffer)
                     self.handle_ubd_request(request, self.buffer)
         except OSError as e:
@@ -65,17 +64,17 @@ class UBDS3Handler(Thread):
 
         try:
             if req_type == UBD_MSGTYPE_READ:
-                log.info("Read request: %d-%d", offset, offset+length)
+                log.debug("Read request: %d-%d", offset, offset+length)
                 buf[:length] = self.volume.read(offset, length)
                 msg.ubd_size = length
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_WRITE:
-                log.info("Write request: %d-%d", offset, offset+length)
+                log.debug("Write request: %d-%d", offset, offset+length)
                 self.volume.write(offset, buf.raw[:length])
                 msg.ubd_size = 0
                 msg.ubd_status = length
             elif req_type == UBD_MSGTYPE_DISCARD:
-                log.info("Discard request: %d-%d", offset, offset+length)
+                log.debug("Discard request: %d-%d", offset, offset+length)
                 self.volume.trim(offset, length)
                 msg.ubd_size = 0
                 msg.ubd_status = length
